@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "bl",
+    "kernel",
+    "amd64",
+]
