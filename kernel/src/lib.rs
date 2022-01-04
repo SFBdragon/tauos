@@ -3,11 +3,11 @@
 #![feature(int_log)]
 #![feature(ptr_metadata)]
 #![feature(ptr_as_uninit)]
-#![feature(inline_const)]
 
 pub mod mem;
 pub mod out;
 pub mod utils;
+
 
 pub struct BootPayload {
     /// The UEFI system table
@@ -21,11 +21,11 @@ pub struct BootPayload {
 
     /// Up-to-date UEFI memory map
     /// 
-    /// Memory map is page-aligned and stored in a seperate LOADER_DATA memory region
+    /// Memory map is page-aligned and stored in a LOADER_DATA memory region
     pub mmap: &'static mut [uefi::table::boot::MemoryDescriptor],
 
     /// The kernel binary data
     /// 
-    /// Data is page-aligned and stored in a seperate LOADER_DATA memory region
+    /// Data is page-aligned and stored in a LOADER_DATA memory region
     pub bin: &'static [u8],
 }

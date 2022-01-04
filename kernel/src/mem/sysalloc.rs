@@ -1,12 +1,10 @@
 use core::{
     ptr::{self, NonNull},
     alloc::{GlobalAlloc, Layout},
-    arch::x86_64::{_blsmsk_u64, _blsr_u64}, mem::MaybeUninit
 };
-
+use crate::utils::LlistNode;
 use amd64::paging;
 use spin::Mutex;
-use crate::utils::LlistNode;
 
 /*
     Allocations of arena size, even when a power of two, are disallowed.
@@ -14,120 +12,129 @@ use crate::utils::LlistNode;
     The smallest block must be greater or equal to sixteen, 0x10.
 */
 
+
+/// # Safety:
+/// `val` must be nonzero
+#[inline]
+const unsafe fn fast_non0_log2(val: u64) -> u64 {
+    // Fails with attempt to wrapping subtract in debug mode when zero.
+    // Zero is undefined behaviour in release mode?
+    63 ^ val.leading_zeros() as u64
+}
+/// # Safety:
+/// `val` must be nonzero
+#[inline]
+const unsafe fn fast_non0_prev_pow2(val: u64) -> u64 {
+    1 << fast_non0_log2(val)
+}
+/// # Safety:
+/// `val` must be nonzero 
+#[inline]
+const unsafe fn fast_non0_next_pow2(val: u64) -> u64 {
+    // Fails with attempt to wrapping subtract in debug mode when zero.
+    // Zero is undefined behaviour in release mode?
+    1 << 64 - (val - 1).leading_zeros() 
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArenaConfig {
+    /// The base of the arena, a casted pointer.
+    pub base: u64,
+    /// Size of the arena in bytes.
+    pub size: u64,
+    /// The power of two of the smallest allocatable block size.
+    pub smlst_pow2: u32,
+}
+
+impl ArenaConfig {
+    /// Returns the alignment required by `self`'s `size` and `GRANULARITY`.
+    /// 
+    /// Types usually don't require alignment larger than their size, and the largest alignment that a
+    /// rust type can demand is 4KiB. The largest type this allocator will allow is the floor(log2(arena size))
+    /// due to the buddy allocation mechanism. The required alignment is thusly derived.
+    pub const fn req_align(&self) -> u32 {
+        if self.size.log2() < paging::PTE_MAPPED_SIZE.trailing_zeros() {
+            self.size.log2()
+        } else {
+            paging::PTE_MAPPED_SIZE.trailing_zeros()
+        }
+    }
+
+    /// Shrink the arena to reach a valid state. This does not adjust the configuration if it is already valid.
+    /// 
+    /// `align_base_else_size` defines which end of the arena is shrunk to satisfy alignment.
+    /// Note that the other end of the arena is shrunk to eliminate dead space.
+    pub fn shrink_to_valid(&mut self, align_base_else_size: bool) {
+        let req_align = self.req_align();
+
+        // align base/acme by shrinking the arena accordingly
+        if align_base_else_size && self.base.trailing_zeros() < req_align {
+            self.base = (self.base >> req_align) + 1 << req_align;
+        } else if !align_base_else_size && (self.base + self.size).trailing_zeros() < req_align {
+            self.size = ((self.base + self.size) >> req_align << req_align) - self.base;
+        }
+
+        // req_align may have changed in some edge cases here, but will not be more demanding
+        // aligning back to the new align may make slightly more memory available, but may in turn
+        // change the required alignment back, causing a nasty edge case
+
+        // if there is dead space in the arena, shrink the arena at the opposite end to alignment
+        if self.size & (1 << self.smlst_pow2) - 1 != 0 {
+            if align_base_else_size {
+                self.size = self.size >> self.smlst_pow2 << self.smlst_pow2;
+            } else {
+                self.base = (self.base >> self.smlst_pow2) + 1 << self.smlst_pow2;
+            }
+        }
+    }
+
+
+    /// Ensure `self` is a valid arena configuration for the system allocator.
+    pub const fn validate(&self) {
+        // ensure none of the fields are zero
+        assert!(self.base != 0, "ArenaConfig with a base of zero is invalid.");
+        assert!(self.size != 0, "ArenaConfig with a size of zero is invalid.");
+        
+        // ensure granularity is within expected bounds
+        assert!(self.smlst_pow2 <= 3,
+            "ArenaConfig with an allocatable block smaller than 16 bytes is invalid.");
+
+        // ensure size does not contain unusable space:
+        // no bits pertaining to blocks smaller than smallest allocatable are set
+        assert!(self.size.trailing_zeros() >= self.smlst_pow2,
+            "ArenaConfig size contains unusable space, which is invalid.");
+
+        let req_align = self.req_align();
+
+        // ensure required alignment is satisfied either by the base or the acme
+        assert!(self.base.trailing_zeros() >= req_align || (self.base + self.size).trailing_zeros() >= req_align,
+            "ArenaConfig where neither the base or acme are aligned to requirement is invalid.");
+    }
+
+    /// Returns the granularity to be used by the allocator.
+    pub const fn granularity(&self) -> usize {
+        self.validate();
+        (64 - self.smlst_pow2 - self.size.leading_zeros()) as usize
+    }
+}
+
+
 #[derive(Debug)]
-struct SysAllocMutInner<const G: usize> {
+struct SysAllocBooks<const G: usize> {
+    /// Bitfield of size `1 << GRANULARITY` in bits, each granularity has a bit for each buddy,
+    /// offset by that width in bits, i.e. level 3 is 4 bits long, 4 bits offset from bitmap base.
+    /// * Clear bit indicates homogeneity: either both are allocated or neither.
+    /// * Set bit indicated heterogeneity: one of the pair is allocated.
+    bitmap: *mut u64,
+    /// Indicates whether a block is available in the linked lists,
+    /// bit index corresponding to index into `llist_heads`.
     avl_llists: u64,
+    /// The heads of the linked lists that each hold available blocks per size.
     llist_heads: [LlistNode<()>; G],
 }
 
-#[derive(Debug)]
-pub struct SysAlloc<const GRANULARITY: usize> {
-    arena: *mut u8,
-    arena_size: u64,
-    lsgst_size: u64,
-    smlst_size: u64,
-
-    bitmap: *mut u64,
-
-    inner: spin::Mutex<SysAllocMutInner<GRANULARITY>>
-}
-
-
-impl<const GRANULARITY: usize> SysAlloc<GRANULARITY> {
-    /// # Safety:
-    /// Call `init` on the returned instance before using it.
-    pub const unsafe fn new() -> Self {
-        //const INVALID_LLIST_NODE: LlistNode<'static, ()> = unsafe { LlistNode::new_llist_invalid(()) };
-
-        Self { 
-            arena: ptr::null_mut(),
-            arena_size: 0,
-            lsgst_size: 0,
-            smlst_size: 0,
-            bitmap: ptr::null_mut(),
-            inner: Mutex::new(
-                SysAllocMutInner {
-                    avl_llists: 0,
-                    llist_heads: [const { unsafe { LlistNode::new_llist_invalid(()) } }; GRANULARITY],
-                }
-            )
-        }
-    }
-
-    #[allow(dead_code)]
-    /// todo
-    pub unsafe fn init(&mut self, arena: *mut u8, arena_size: u64, bitmap: *mut u64) {
-        assert!(GRANULARITY != 0);
-
-        // Ensure that blocks below a size of sixteen cannot be produced, as not to impede linked list node storage.
-        assert!(arena_size.log2() - GRANULARITY as u32 >= 3);
- 
-        // Types usually don't require alignment larger than their size, and the largest alignment that a
-        // rust type can demand is 4KiB. The largest type this allocator will allow is the floor(log2(arena_size))
-        // due to the buddy allocation mechanism. The required alignment is thusly derived.
-        let required_alignment = u32::min(arena_size.log2(), paging::PTE_MAPPED_SIZE.trailing_zeros());
-
-        // Initialize self
-        self.arena = arena;
-        self.arena_size = arena_size;
-        self.lsgst_size = 1 << arena_size.log2();
-        self.smlst_size = 1 << (arena_size.log2() - GRANULARITY as u32 + 1);
-        self.bitmap = bitmap;
-
-        let mut inner = self.inner.lock();
-
-        for node in inner.llist_heads.iter_mut() {
-            node.init_llist();
-        }
-
-        // Alignment can be satisfied in two ways: base and end.
-        // End is preferable due to realloc performance from initial allocations
-        let top_aligned = (arena as u64 + arena_size).trailing_zeros() >= required_alignment;
-        assert!(top_aligned | ((arena as u64).trailing_zeros() >= required_alignment));
-
-        let mut arena_size_bitmap = arena_size;
-        let (mut addr_offset, offset_coeff) = if top_aligned {
-            (arena as u64 + arena_size, -1i64 as u64)
-        } else {
-            (arena as u64, 1)
-        };
-
-        while arena_size_bitmap != 0 {
-            let block_size = _blsr_u64(arena_size_bitmap);
-            arena_size_bitmap = arena_size_bitmap ^ block_size;
-
-            addr_offset = addr_offset.wrapping_add(block_size * offset_coeff);
-            let index = self.block_index(block_size);
-            let head_ptr = inner.llist_heads.get_unchecked_mut(index);
-
-            todo!();
-            //LlistNode::new((addr_offset as *mut LlistNode<'llists, ()>).as_uninit_mut().unwrap(), head_ptr, head_ptr, ());
-            //self.toggle_bit_flag(block_size, addr_offset);
-            inner.avl_llists |= index as u64;
-        }
-    }
-
-    #[inline]
-    fn block_index(&self, size: u64) -> usize {
-        // this is effectively computing: arena_size.log2() - size.log2()
-        (size.leading_zeros() - self.arena_size.leading_zeros()) as usize
-    }
-    
-    /// Returns the offset in bits into the bitmap that indicates buddy status.
-    /// Use `toggle_bitflag` to toggle the bit by passing in the returned value.
-    /// 
-    /// * Clear bit indicates homogeneity: either both are allocated or neither.
-    /// * Set bit indicated heterogeneity: one of the pair is allocated.
-    /// 
-    /// # Safety:
-    /// `addr` must be within the arena. Assumes `size` is a power of two implicitly.
-    #[inline]
-    unsafe fn get_bitmap_offset(&self, size: u64, addr: u64) -> u64 {
-        self.lsgst_size + addr - self.arena as u64 >> 64 - size.leading_zeros()
-        // expanded:
-        // base = lsgst_size >> log2(size) - 1
-        // offset = base + (addr - arena_base >> log2(size) - 1))
-    }
+impl<const GRANULARITY: usize> SysAllocBooks<GRANULARITY> {
     /// Utility function to read the bitmap at the offset in bits
     #[inline]
     unsafe fn read_bitflag(&self, bitmap_offset: u64) -> bool {
@@ -135,116 +142,238 @@ impl<const GRANULARITY: usize> SysAlloc<GRANULARITY> {
     }
     /// Utility function to toggle the bitmap at the offset in bits
     #[inline]
-    unsafe fn toggle_bitflag(&self, bitmap_offset: u64) {
+    unsafe fn toggle_bitflag(&mut self, bitmap_offset: u64) { // takes &mut intentionally
         *self.bitmap.wrapping_add(bitmap_offset as usize >> 6) ^= 1 << (bitmap_offset & 63);
     }
 
-  /*   #[inline]
-    unsafe fn add_block(&self, granularity: usize, size: usize, avl_llists: &mut u64,
-    llist_heads: &mut [LlistNode<()>; GRANULARITY], ptr: NonNull<LlistNode<()>>) {
-        if *avl_llists & 1 << granularity != 0 {
+    #[inline]
+    unsafe fn add_block(&mut self, granularity: usize, bitmap_offset: u64, node: NonNull<LlistNode<()>>) {
+        if self.avl_llists & 1 << granularity == 0 {
             // populating llist
-            *avl_llists |= 1 << granularity;
+            self.avl_llists |= 1 << granularity;
         }
 
         // add node from llist
-        LlistNode::new(ptr, 
-            NonNull::new_unchecked(ptr::addr_of_mut!(llist_heads[granularity])),
-            llist_heads[granularity].next.get(),
-        ());
+        let head = self.llist_heads.get_unchecked_mut(granularity);
+        LlistNode::new(node, 
+            head.into(),
+            head.next.get(),
+            ()
+        );
 
         // toggle bitmap flag
-        self.toggle_bit_flag(size, ptr.as_ptr() as usize);
-    } */
+        self.toggle_bitflag(bitmap_offset);
+    }
     #[inline]
-    unsafe fn remove_block(&self, granularity: usize, size: u64, avl_llists: &mut u64, ptr: *mut LlistNode<()>) {
-        if (*ptr).next == (*ptr).prev {
-            // last free block in llist, toggle off avl flag
-            *avl_llists &= !(1 << granularity);
+    unsafe fn remove_block(&mut self, granularity: usize, bitmap_offset: u64, node: NonNull<LlistNode<()>>) {
+        if node.as_ref().next.get() == node.as_ref().prev.get() {
+            // last block in llist, toggle off avl flag
+            self.avl_llists &= !(1 << granularity);
         }
 
         // remove node from llist
-        todo!();
-        //LlistNode::remove(NonNull:: ptr);
+        LlistNode::remove(node);
 
         // toggle bitmap flag
-        self.toggle_bitflag(self.get_bitmap_offset(size, ptr as u64));
+        self.toggle_bitflag(bitmap_offset);
+    }
+}
+
+
+#[derive(Debug)]
+pub struct SysAlloc<const GRANULARITY: usize> {
+    /// The base of the arena, a casted pointer.
+    base: u64,
+    /// Size of the arena in bytes.
+    size: u64,
+
+    /// Size of the largest allocatable block in bytes.
+    lrgst: u64,
+    /// Size of the smallest allocatable block in bytes.
+    smlst: u64,
+
+    virt_size: u64,
+    virt_base: u64,
+
+    /// Mutex-guarded mutable bookkeeping data
+    books: spin::Mutex<SysAllocBooks<GRANULARITY>>,
+}
+
+
+impl<const GRANULARITY: usize> SysAlloc<GRANULARITY> {
+    /// # Safety:
+    /// Call `init` on the returned instance before using it.
+    pub const unsafe fn new_invalid() -> Self {
+        const INVALID_LLIST_NODE: LlistNode<()> = unsafe { LlistNode::new_llist_invalid(()) };
+
+        Self {
+            base: 0,
+            size: 0,
+            lrgst: 0,
+            smlst: 0,
+            virt_base: 0,
+            virt_size: 0,
+
+            books: Mutex::new(
+                SysAllocBooks {
+                    bitmap: ptr::null_mut(),
+                    avl_llists: 0,
+                    llist_heads: [INVALID_LLIST_NODE; GRANULARITY],
+                }
+            )
+        }
+    }
+
+    /// todo
+    pub unsafe fn init(&mut self, config: ArenaConfig, bitmap: *mut u64) {
+        // Ensure the arena configuration is valid
+        config.validate();
+        // Ensure granularities match
+        assert!(GRANULARITY == config.granularity());
+
+        // Initialize self
+        self.base = config.base;
+        self.size = config.size;
+        self.lrgst = fast_non0_prev_pow2(config.size); // size was validated
+        self.smlst = 1 << config.smlst_pow2;
+        self.virt_size = fast_non0_next_pow2(config.size); // size was validated
+        self.virt_base = {
+            let req_align = config.req_align();
+            if self.base.trailing_zeros() >= req_align {
+                self.base
+            } else {
+                self.base.wrapping_sub(self.virt_size)
+            }
+        };
+
+        let mut books = self.books.lock();
+        books.avl_llists = 0;
+        books.bitmap = bitmap;
+        for node in books.llist_heads.iter_mut() {
+            node.init_llist();
+        }
+
+        // Alignment can be satisfied at both arena base and/or arena end
+        let is_base_aligned = self.base == self.virt_base;
+        let mut offset_base = if is_base_aligned { self.base } else { self.base + self.size };
+        let mut arena_size_bitmap = self.size;
+        while arena_size_bitmap != 0 {
+            let block_size = fast_non0_prev_pow2(arena_size_bitmap);
+            let granularity = self.block_granularity(block_size);
+            arena_size_bitmap = arena_size_bitmap ^ block_size;
+
+            if !is_base_aligned { offset_base = offset_base.wrapping_sub(block_size); }
+
+            // add block to avl_llists and llist_heads
+            // no not toggle bitmap bits, as the buddies cannot be reclaimed
+            books.avl_llists |= 1 << granularity;
+            let head = books.llist_heads.get_unchecked_mut(granularity);
+            LlistNode::new(NonNull::new_unchecked(offset_base as *mut _),
+                head.into(), head.next.get(), ());
+
+            if is_base_aligned { offset_base = offset_base.wrapping_add(block_size); }
+        }
+    }
+
+    #[inline]
+    fn block_granularity(&self, size: u64) -> usize {
+        // this is effectively computing: largest_block_size.log2() - size.log2()
+        (size.leading_zeros() - self.size.leading_zeros()) as usize
+    }
+    
+    /// Returns the offset in bits into the bitmap that indicates buddy status.
+    /// # Safety:
+    /// * `base` must be within the arena.
+    /// * `size` must be nonzero
+    #[inline]
+    unsafe fn bitmap_offset(&self, base: u64, size: u64) -> u64 {
+        self.virt_size.wrapping_add(base.wrapping_sub(self.virt_base)) >> fast_non0_log2(size) + 1
+        // arena.virt_size >> log2(size) + 1
+        // plus
+        // base - arena.virt_base >> log2(size) + 1
+    }
+
+    #[inline]
+    unsafe fn is_lower_buddy(&self, base: u64, size: u64) -> bool {
+        base.wrapping_sub(self.virt_base) & size == 0
     }
 }
 
 unsafe impl<const GRANULARITY: usize> GlobalAlloc for SysAlloc<GRANULARITY> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut sync = self.inner.lock();
-        let size = fast_non0_next_pow2(layout.size() as u64).max(self.smlst_size);
-        let req_index = self.block_index(size);
+        let mut books = self.books.lock();
 
-        let tgt_index: usize;
-        if size >= layout.align() as u64 {
-            if sync.avl_llists & 1 << req_index != 0 {
-                let next = sync.llist_heads.get_unchecked_mut(req_index).next.get().as_ptr();
-                self.remove_block(req_index, size, &mut sync.avl_llists, next);
-                return next.cast();
-            } else {
-                tgt_index = req_index;
-            }
-        } else {
-            // tgt may now be less that req, as extra align in required
-            tgt_index = self.block_index(layout.align() as u64);
+        // Get the maximum between the required size as a power of two, the smallest allocatable,
+        // and the alignment. The alignment being larger than the size is a rather esoteric case,
+        // which is handled by simply allocating a larger size with the required alignment. This
+        // may be highly memory inefficient for very bizarre scenarios.
+        let size = fast_non0_prev_pow2( // unbranched maximum between or'd values
+            fast_non0_next_pow2(layout.size() as u64) // ZSTs are never allocated
+            | self.smlst
+            | layout.align() as u64
+        ); 
+        let granularity = self.block_granularity(size);
+
+        if books.avl_llists & 1 << granularity != 0 { // if a block of size is available, allocate it
+            let next = books.llist_heads.get_unchecked_mut(granularity).next.get();
+            books.remove_block(granularity, self.bitmap_offset(next.as_ptr() as u64, size), next);
+            return next.as_ptr().cast();
         }
 
-        // find a larger block to break apart
-        // mask out bits for smaller blocks
-        let larger_avl = sync.avl_llists & _blsmsk_u64(1 << tgt_index);
-        if larger_avl == 0 {
-            panic!("not enough memory!")
-        } else {
-            let lgr_index: usize;
-            // the compiler doesn't emit this for some reason, even though it won't cause UB here ever
-            asm!("bsr {}, {}", lateout(reg) lgr_index, in(reg) larger_avl, options(nomem, nostack, preserves_flags));
+        // find a larger block to break apart - mask out bits for smaller blocks
+        let larger_avl = books.avl_llists & core::arch::x86_64::_blsmsk_u64(1 << granularity);
+        if larger_avl == 0 { return ptr::null_mut(); } // not enough memory
+        
+        let lgr_granularity = larger_avl.trailing_zeros() as usize;
+        let lgr_size = self.lrgst >> lgr_granularity;
+        let lgr_block = books.llist_heads.get_unchecked_mut(lgr_granularity).next.get();
+        
+        // remove the large block, it is guaranteed to be broken
+        books.remove_block(
+            lgr_granularity,
+            self.bitmap_offset(lgr_block.as_ptr() as u64, lgr_size),
+            lgr_block
+        );
 
-            let lgr_block = sync.llist_heads.get_unchecked_mut(lgr_index).next.get();
-            let lgr_size = self.lsgst_size >> lgr_index;
+        // break down the large block into smaller blocks until the required size is reached
+        let mut hi_block_size = lgr_size >> 1;
+        for hi_granularity in (lgr_granularity + 1)..=granularity {
+            let hi_block_base = (lgr_block.as_ptr() as u64).wrapping_add(hi_block_size);
+            books.add_block(
+                hi_granularity,
+                self.bitmap_offset(hi_block_base, hi_block_size),
+                NonNull::new_unchecked(hi_block_base as *mut _)
+            );
 
-            let mut block_size = lgr_size;
-            for granularity in lgr_index..req_index {
-                block_size >>= 1;
-                
-                // add block
-                let head_ptr = sync.llist_heads.get_unchecked_mut(granularity);
-                let next_ptr = head_ptr/* .as_ref() */.next.get().as_mut();
-                let block_ptr =/*  NonNull::new_unchecked( */
-                    lgr_block.as_ptr().cast::<u8>().wrapping_add(block_size as usize).cast::<LlistNode<()>>();
-
-            
-                todo!();
-                //if head_ptr == next_ptr { sync.avl_llists |= 1 << granularity; } // update avl_llists
-                //self.toggle_bitflag(block_size, block_ptr.as_ptr() as u64); // update bitmap
-                //LlistNode::new(block_ptr.as_uninit_mut().unwrap(), head_ptr, next_ptr, ()); // update llist
-            }
-
-            // remove the large block, it is guaranteed to have been broken
-            self.remove_block(lgr_index, lgr_size, &mut sync.avl_llists, lgr_block.as_ptr());
-
-            return lgr_block.as_ptr().cast();
+            hi_block_size >>= 1;
         }
+
+        return lgr_block.as_ptr().cast();
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let mut block_size = fast_non0_next_pow2(layout.size() as u64).max(self.smlst_size);
-        let mut block_ptr = ptr;
-        let mut granularity = self.block_index(block_size);
+        let mut books = self.books.lock();
         
-        let mut bitmap_offset = self.get_bitmap_offset(block_size, ptr as u64);
-        while self.read_bitflag(bitmap_offset) { // while buddy isn't allocated
-        todo!();
-            //LlistNode::remove(node)
-        }
-        // next) shift size, shift align if necessary(req full align?/do mod from arena?), shift granularity
-        // loop check bitmap at loc for set bits
-        //     update bitmap
-        //     remove llist, update avls 
+        let mut base = ptr as u64;
+        let mut size = fast_non0_prev_pow2( // unbranched maximum between or'd values
+            fast_non0_next_pow2(layout.size() as u64) // ZSTs are never allocated
+            | self.smlst
+            | layout.align() as u64
+        );
+        let mut granularity = self.block_granularity(size);
+        let mut bitmap_offset = self.bitmap_offset(base, size);
 
-        todo!()
+        while books.read_bitflag(bitmap_offset) { // while buddy is available
+            books.remove_block(granularity, bitmap_offset, NonNull::new_unchecked(base as *mut _));
+
+            if self.is_lower_buddy(base, size) { base = base.wrapping_sub(size); }
+            size <<= 1;
+            granularity -= 1;
+            bitmap_offset = self.bitmap_offset(base, size);
+        }
+
+        // add block to the books
+        books.add_block(granularity, bitmap_offset, NonNull::new(base as _).unwrap());
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -254,14 +383,80 @@ unsafe impl<const GRANULARITY: usize> GlobalAlloc for SysAlloc<GRANULARITY> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        todo!()
+        let old_size = fast_non0_prev_pow2( // unbranched maximum between or'd values
+            fast_non0_next_pow2(layout.size() as u64) // ZSTs are never allocated
+            | self.smlst
+            | layout.align() as u64
+        );
+        let tgt_size = fast_non0_prev_pow2( // unbranched maximum between or'd values
+            fast_non0_next_pow2(new_size as u64) // ZSTs are never allocated
+            | self.smlst
+            | layout.align() as u64
+        );
+
+        let old_granularity = self.block_granularity(old_size);
+        let new_granularity = self.block_granularity(tgt_size);
+
+        let mut books = self.books.lock();
+
+        if tgt_size < old_size {
+            // if size is smaller, break up the block
+            // follows similar routine to alloc
+
+            // remove the old block, it is guaranteed to be broken
+            books.remove_block(
+                self.block_granularity(old_size),
+                self.bitmap_offset(ptr as u64, old_size),
+                NonNull::new_unchecked(ptr.cast())
+            );
+
+            // break down the large block into smaller blocks until the required size is reached
+            let mut hi_block_size = old_size >> 1;
+            for hi_granularity in (old_granularity + 1)..=new_granularity {
+                let hi_block_base = (ptr as u64).wrapping_add(hi_block_size);
+                books.add_block(
+                    hi_granularity,
+                    self.bitmap_offset(hi_block_base, hi_block_size),
+                    NonNull::new_unchecked(hi_block_base as *mut _)
+                );
+
+                hi_block_size >>= 1;
+            }
+        } else if tgt_size > old_size {
+            // if size is bigger, check buddies recursively, if available, reserve them, else alloc and dealloc
+            // follows a similar routine to dealloc
+
+            // this stores (base, bitmap_offset) per granularity - it does, however, make the stack frame massive
+            let mut chopping_block = [(0, 0); GRANULARITY];
+
+            let mut base = ptr as u64;
+            let mut size = old_size;
+            let mut bitmap_offset = self.bitmap_offset(base, size);
+
+            for granularity in ((new_granularity + 1)..=old_granularity).rev() {
+                if books.read_bitflag(bitmap_offset) { // while buddy is available
+                    *chopping_block.get_unchecked_mut(granularity) = (base, bitmap_offset);
+    
+                    if self.is_lower_buddy(base, size) { base = base.wrapping_sub(size); }
+                    size <<= 1;
+                    bitmap_offset = self.bitmap_offset(base, size);
+                } else {
+                    // cannot realloc in place, simply allocate and copy
+                    drop(books);
+                    let allocd = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
+                    ptr::copy_nonoverlapping(ptr, allocd, layout.size());
+                    self.dealloc(ptr, layout);
+                    return allocd;
+                }
+            }
+
+            // the buddies were available - delist them
+            for granularity in ((new_granularity + 1)..=old_granularity).rev() {
+                let (base, bitmap_offset) = *chopping_block.get_unchecked_mut(granularity);
+                books.remove_block(granularity, bitmap_offset, NonNull::new_unchecked(base as _));
+            }
+        }
+
+        ptr
     }
-}
-
-
-#[inline]
-const unsafe fn fast_non0_next_pow2(input: u64) -> u64 {
-    // Fails with attempt to wrapping subtract in debug mode when zero.
-    // Zero is undefined behaviour in release mode?
-    1 << 64 - (input - 1).leading_zeros() 
 }

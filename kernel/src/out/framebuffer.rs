@@ -1,4 +1,4 @@
-use core::marker::PhantomData;
+// use core::marker::PhantomData;
 
 
 
@@ -61,7 +61,7 @@ impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
 }
 
 
-#[derive(Debug)]
+/* #[derive(Debug)]
 struct FrameBuffer<'a> {
     //base: *mut u8,
     //slice: &'a mut [u32], // TODO: fix and settle
@@ -116,7 +116,7 @@ impl<'a> FrameBuffer<'a> {
 
     //pub fn write() {}
     //pub fn read() {}
-}
+} */
 
 
 

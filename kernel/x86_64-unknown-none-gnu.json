@@ -26,7 +26,7 @@
 	"code-model": "kernel",
 	"relocation-model": "static",
 
-    "stack-probes": { "kind": "call" },
+    "stack-probes": { "kind": "inline" },
 
     "exe-suffix": ""
 }

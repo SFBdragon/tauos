@@ -4,15 +4,15 @@
 #![feature(alloc_error_handler)]
 
 
-use core::{panic::PanicInfo, ffi::c_void};
-
+use core::panic::PanicInfo;
+ 
 use amd64;
 use libkernel::*;
 
 const KERNEL_HEAP_GRANULARITY: usize = 10;
 
 #[global_allocator]
-static mut ALLOCATOR: mem::sysalloc::SysAlloc::<KERNEL_HEAP_GRANULARITY> = unsafe { mem::sysalloc::SysAlloc::<KERNEL_HEAP_GRANULARITY>::new() };
+static mut ALLOCATOR: mem::sysalloc::SysAlloc::<KERNEL_HEAP_GRANULARITY> = unsafe { mem::sysalloc::SysAlloc::<KERNEL_HEAP_GRANULARITY>::new_invalid() };
 
 
 static mut PAYLOAD: Option<BootPayload> = None;
@@ -44,10 +44,10 @@ fn main() -> ! {
     
 
     // parse out tables
-    let mut rsdp: *const c_void;
-    for table in payload.st.config_table() { // panics!
+    //let mut rsdp: *const c_void;
+    for table in payload.st.config_table() {
         match table.guid {
-            uefi::table::cfg::ACPI2_GUID => { rsdp = table.address; },
+            uefi::table::cfg::ACPI2_GUID => { /* rsdp = table.address; */ },
             uefi::table::cfg::ACPI_GUID => { },
             uefi::table::cfg::PROPERTIES_TABLE_GUID => { /* not useful */ },
             _ => (),
@@ -61,8 +61,9 @@ fn main() -> ! {
     unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
 
 
+
     unsafe {
-        ALLOCATOR.init(core::ptr::null_mut(), 0, core::ptr::null_mut());
+        ALLOCATOR.init(mem::sysalloc::ArenaConfig { base: 0, size: 0, smlst_pow2: 0 }, core::ptr::null_mut());
     }
 
     println!("here8");

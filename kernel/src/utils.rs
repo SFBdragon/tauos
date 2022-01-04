@@ -47,7 +47,8 @@ impl<T> LlistNode<T> {
             data,
         }
     }
-    /// Use to initialize nodes produced by `new_llist_invalid`.
+    /// Initialize nodes produced by `new_llist_invalid`. Can be used on initialized
+    /// nodes, though it is recommended that they are not a member of a linked list.
     #[inline]
     pub fn init_llist(&mut self) {
         let ptr = self as *mut _;
@@ -64,10 +65,12 @@ impl<T> LlistNode<T> {
     #[inline]
     pub unsafe fn new_llist(node: &mut MaybeUninit<Self>, data: T) {
         *node = MaybeUninit::new(Self {
-            prev: Cell::new(ptr),
-            next: Cell::new(ptr),
+            prev: Cell::new(NonNull::dangling()),
+            next: Cell::new(NonNull::dangling()),
             data,
         });
+        node.assume_init_ref().prev.set(node.assume_init_ref().into());
+        node.assume_init_ref().next.set(node.assume_init_ref().into());
     }
 
     /// Create a new node as a member of an existing linked list in place of `ptr`.
@@ -102,17 +105,18 @@ impl<T> LlistNode<T> {
     /// 
     /// # Arguments
     /// 
-    /// * `start` and `end` can be identical (chain-to-move contains only 1 node).
-    /// * `prev` and `next` can be identical (chain-to-move will be linked around a 'head' (`prev`/`next`)).
+    /// * `start` and `end` can be identical (relink 1 node).
+    /// * `prev` and `next` can be identical (relink around a 'head' - `prev`/`next`).
     /// * All 4 arguments can be identical (orphans a single node as its own linked list).
+    /// 
+    /// While `start`/`end` and `prev`/`next` should belong to the same lists respectively, this is not required.
+    /// Not doing so is implementation defined, and may create complex or nonsensical links.
     /// 
     /// # Safety:
     /// 
     /// * `start` and `end` must be initialized
-    /// * `start` and `end` must belong to the same linked list.
     /// * `prev` and `next` must be initialized
-    /// * `prev` and `next` must belong to the same linked list.
-    pub unsafe fn change_list(start: NonNull<Self>, end: NonNull<Self>, prev: NonNull<Self>, next: NonNull<Self>) {
+    pub unsafe fn relink(start: NonNull<Self>, end: NonNull<Self>, prev: NonNull<Self>, next: NonNull<Self>) {
         // link up old list
         start.as_ref().prev.get().as_mut().next.set(end.as_ref().next.get());
         end.as_ref().next.get().as_mut().prev.set(start.as_ref().prev.get());

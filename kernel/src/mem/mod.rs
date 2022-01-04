@@ -22,7 +22,7 @@ pub const PHYS_LADDR_OFFSET: u64 = paging::CANONICAL_HIGHER_HALF + paging::PML4E
 pub const RECURSIVE_INDEX: u64 = 0o400;
 
 pub const KERNEL_STACK_BOTTOM: u64 = KERNEL_CM_LOWER_BOUND - paging::PTE_MAPPED_SIZE;
-pub const KERNEL_STACK_PAGE_COUNT: u64 = 32;
+pub const KERNEL_STACK_PAGE_COUNT: u64 = 128;
 
 
 
@@ -279,8 +279,7 @@ pub fn alloc_setup() {
 
 
 pub fn segmentation_setup() {
-    // todo: consider doing after alloc and setting up properly, rather than 2 stage?
-    // todo: finish tss/fs/gs/other setup
+    // todo: properly alloc gdt and finish tss/fs/gs/other setup
 
 
     // Segmentation is mostly disabled in long, 64-bit mode. However some elements are still used:
@@ -294,12 +293,6 @@ pub fn segmentation_setup() {
     let uefi_gdt = segmentation::sgdt();
     
 
-    // ensure the size is sufficient for the setup process
-    if uefi_gdt.len() < 2 {
-        todo!();
-    }
-
-
     uefi_gdt.iter_mut().for_each(|entry| *entry = 0);
 
     uefi_gdt[0] = 0;
@@ -310,8 +303,6 @@ pub fn segmentation_setup() {
         | CodeSegmentDescriptor::TYPE
         | CodeSegmentDescriptor::LONG_MODE
         | CodeSegmentDescriptor::DPL_RING0).bits();
-
-    // todo!
 
     unsafe {
         // load in the GDT just to make sure
