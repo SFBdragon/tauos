@@ -1,114 +1,117 @@
-//! Module for memory management-related code of the OS.
+#![no_std]
+#![no_main]
+#![feature(asm)]
+#![feature(ptr_metadata)]
+#![feature(alloc_error_handler)]
 
-//mod pmemm;
-pub mod sysalloc;
-
-use amd64::{
-    registers::{CR3, CR0},
-    segmentation::{self, CodeSegmentDescriptor, SegmentSelector},
-    paging::{self, PTE}
-};
-use core::slice;
+use core::{panic::PanicInfo, slice};
+ 
+use amd64::{self, paging::{self, PTE}, registers::{CR3, CR0}, segmentation::{CodeSegmentDescriptor, self, SegmentSelector}};
+use libkernel::{BootPayload, memman, println, out};
 use uefi::table::boot::MemoryType;
 
-/// Kernel code model lower bound address.
-pub const KERNEL_CM_LOWER_BOUND: u64 = 0o177777_777_776_000_000_0000;
-/// Kernel code model upper bound address.
-pub const KERNEL_CM_UPPER_BOUND: u64 = 0o177777_777_777_770_000_0000;
 
-/// The offset to displace physical addresses into linear address space.
-pub const PHYS_LADDR_OFFSET: u64 = paging::CANONICAL_HIGHER_HALF + paging::PML4E_MAPPED_SIZE;
-/// The index to recurr through the PML4T onto itself.
-pub const RECURSIVE_INDEX: u64 = 0o400;
+static mut PAYLOAD: Option<BootPayload> = None;
 
-pub const KERNEL_STACK_BOTTOM: u64 = KERNEL_CM_LOWER_BOUND - paging::PTE_MAPPED_SIZE;
-pub const KERNEL_STACK_PAGE_COUNT: u64 = 128;
-
-
-
-#[inline]
-fn pt_from_getter<F: FnMut() -> u64>(get_page: &mut F) -> &'static mut [PTE] {
+#[no_mangle]
+#[allow(improper_ctypes_definitions)] // doesn't get called by C code
+pub extern "sysv64" fn _start(payload: BootPayload) -> ! {
+    println!("KERNEL START");
+    
     unsafe {
-        let table = slice::from_raw_parts_mut(get_page() as *mut PTE, 512);
-        table.fill(PTE::empty());
-        table
-    }
+        // store the payload in a static variable
+        // this circumvents the difficulty of accessing old stack data after the stack switch
+        PAYLOAD = Some(payload);
+
+        // switch the stacks onto loader pre-allocated stack area
+        // mem::KERNEL_STACK_BOTTOM itself is unmapped, thus reduce by sixteen (preserves alignment)
+        asm!("mov rsp, {}", in(reg) memman::KERNEL_STACK_BOTTOM - 0x10, options(preserves_flags));
+    };
+
+    // jump to init immediately; don't touch the stack
+    init();
 }
 
-/// Maps the memory of base `phys_base` and size `page_count * 4KiB`, to `virt_base` linear address
-/// and subsequent addresses according to the size. Pages use flags `branch_entry` for non-PTEs
-/// (PDEs, PDPEs, etc.), and `leaf_entry` for PTEs. `table` does not have to be active. `level` would
-/// be `4` for a PML4T. `get_page` should return the base of available pages to be used to store page tables.
-/// 
-/// 
-/// 
-/// NOTE: `virt_base`, `phys_base`, and `page_count` are all modified over the course of the function.
-/// It is recommended that you provide a reference to a clone of the values instead. Using the modified
-/// values are implementation-defined, and the implementation may change.
-/// # Safety:
-/// * the current memory translation must be identity mapping
-/// * `EFER::NXE` must be set if the specified `PTE`s use the corresponding flag
-/// * `virt_base` should not be occupied under the provided PML4T
-/// * `get_pages` should return sufficient valid pages for mapping
-/// * the specified `PTE`s must be valid
-/// * `pml4t` must be valid
-/// * and probably more...
-pub unsafe fn map_pages_when_ident<F>(virt_base: &mut u64, phys_base: &mut u64, page_count: &mut u64,
-branch_entry: PTE, leaf_entry: PTE, level: usize, table: &mut [PTE], get_page: &mut F)
-where F: FnMut() -> u64 {
-    if level > 1 {
-        while *page_count > 0 {
-            let table_index = ((*virt_base & 0o7770 << level * 9) >> level * 9 + 3) as usize;
+fn init() -> ! {
+    // retrieve the payload
+    let payload = unsafe { core::mem::replace(&mut PAYLOAD, None).unwrap() };
 
-            // allocate new page table if none exists
-            if !table[table_index].contains(PTE::PRESENT) {
-                let page_table = pt_from_getter(get_page);
-                table[table_index] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(page_table.as_ptr() as u64);
-            }
-            
-            let lower_table = slice::from_raw_parts_mut(table[table_index].get_paddr() as *mut PTE, 512);
+    println!("KERNEL INIT");
+    println!("UART Chip Version: {:?}", out::uart::UART_COM1.1);
 
-            map_pages_when_ident(
-                virt_base,
-                phys_base,
-                page_count,
-                branch_entry,
-                leaf_entry,
-                level - 1,
-                lower_table,
-                get_page);
+    println!("{}", payload.mmap.iter().fold(0, |s, x| s + x.page_count));
+    
 
-            if table_index == 511 {
-                break;
-            }
-        }
-    } else {
-        while *page_count > 0 {
-            let table_index = paging::pt_index(*virt_base); // level = 1
-            table[table_index] = PTE::from_paddr(*phys_base) | leaf_entry;
-            
-            *page_count -= 1;
-            *virt_base += paging::PTE_MAPPED_SIZE;
-            *phys_base += paging::PTE_MAPPED_SIZE;
-
-            if table_index == 511 {
-                break;
-            }
+    // parse out tables
+    //let mut rsdp: *const c_void;
+    for table in payload.st.config_table() {
+        match table.guid {
+            uefi::table::cfg::ACPI2_GUID => { /* rsdp = table.address; */ },
+            uefi::table::cfg::ACPI_GUID => { },
+            uefi::table::cfg::PROPERTIES_TABLE_GUID => { /* not useful */ },
+            _ => (),
         }
     }
+
+    
+    let payload = paging_setup(payload);
+    
+    unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
+
+    alloc_setup(&payload); // todo
+
+    println!("here8");
+    amd64::hlt_loop();
+
+
+    
+    
+    // framebuffer setup?
+    
+    // alloc
+
+    // acpi rsdp
+    // acpihandler
+    // acpi
+    // madt
+    
+    //mem::segmentation_setup();
+
+    // apic
+    // idt & interrupt handling
+
+
+    //amd64::hlt_loop()
 }
+
+#[panic_handler]
+fn panic_handler(info: &PanicInfo) -> ! {
+    println!("{}", info);
+
+    amd64::hlt_loop()
+}
+
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    panic!("Allocator Error: {:?}", layout)
+}
+
 
 
 pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
 
     /*                                     SET UP PAGING
     Goals:
-     - all pages should be immediately accessible without 'walking'
-     - all of physical memory should be immediately accessible without 'walking'
-     - the linear addresses to achieve the above should not interfere with the canonical lower half
+    - all pages should be immediately accessible without walking
+    - all of physical memory should be immediately accessible without walking
+    - the linear addresses to achieve the above should not interfere with the canonical lower half
 
-    A combination of the resursive page table entry mechanism and a fixed-offset memory mapping are used.
+    Solution:
+    A combination of the resursive page table entry mechanism and fixed-offset memory mapping.
+    - The recursive index is 256 (0o400, 0x100) (the first of the canonical higher half).
+    - The fixed offset is 0xffff_8080_0000_0000, essentially FROM pml4t index 257, mapped using 1GiB size pages.
 
+    Rationale:
     While fixed-offset mapping can be employed in a manner that dually allows for immidiate addressal of 
     page tables by laying the tables out over physical memory in a regular manner (fragmenting physical
     address space but allowing virtual address space to rectify that), it risks colliding with already
@@ -116,13 +119,21 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
     wherever available, and rescursive paging allows for immediate access to them, all the while addressing
     unmapped page tables is still convenient.
     
-    The recursive index is 256 (0o400, 0x100) (the first of the canonical higher half).
-    The fixed offset is 0xffff_8080_0000_0000, essentially FROM pml4t index 257, mapped using 1GiB size pages.
-    
+    Notes:
     It is guaranteed by the handoff state of UEFI and the OS loader that physical memory is flat/identity-mapped
     and that segmentation, by virtue of being in long mode, is essentially disabled.
     All pages are located within LOADER_DATA and BOOT_SERVICES_DATA memory regions as speficied by the UEFI map.
     */
+
+    #[inline]
+    fn pt_from_getter<F: FnMut() -> u64>(get_page: &mut F) -> &'static mut [PTE] {
+        unsafe {
+            let table = core::slice::from_raw_parts_mut(get_page() as *mut PTE, 512);
+            table.fill(PTE::empty());
+            table
+        }
+    }
+
 
     // find the size of physical memory
     let total_phys_pages = payload.mmap.iter().fold(0, |acc, desc| acc + desc.page_count);
@@ -148,11 +159,11 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
     cr3.set_paddr(pml4t.as_ptr() as u64);
 
     // install recursive entry
-    pml4t[RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pml4t.as_ptr() as u64);
+    pml4t[memman::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pml4t.as_ptr() as u64);
 
     // map physical memory
     let pmap_pdpt = pt_from_getter(&mut get_page);
-    pml4t[paging::pml4t_index(PHYS_LADDR_OFFSET)] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pmap_pdpt.as_ptr() as u64);
+    pml4t[paging::pml4t_index(memman::PHYS_LADDR_OFFSET)] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pmap_pdpt.as_ptr() as u64);
 
     for phys_gibi in 0..((total_phys_size + paging::PDPE_MAPPED_SIZE - 1) / paging::PDPE_MAPPED_SIZE) { // round up
         pmap_pdpt[phys_gibi as usize] = PTE::PRESENT | PTE::WRITE | PTE::HUGE_PAGE | PTE::from_paddr(phys_gibi * paging::PDPE_MAPPED_SIZE);
@@ -160,10 +171,10 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
 
     // map the UEFI GOP frame buffer into fixed-offset space too
     // it is identity mapped outside of physical address space - per testing
-    pmap_pdpt[paging::pdpt_index(payload.frame_buffer_ptr as u64 + PHYS_LADDR_OFFSET)] = 
+    pmap_pdpt[paging::pdpt_index(payload.frame_buffer_ptr as u64 + memman::PHYS_LADDR_OFFSET)] = 
         PTE::PRESENT | PTE::WRITE | PTE::HUGE_PAGE | PTE::from_paddr(payload.frame_buffer_ptr as u64);
     // check if a second page is needed (shouldn't be the case, the framebuffer is usually - per testing - gibibyte-aligned)
-    let fb_size = payload.frame_buffer_info.stride() * payload.frame_buffer_info.resolution().1 * crate::out::framebuffer::PIXEL_WIDTH;
+    let fb_size = payload.frame_buffer_info.stride() * payload.frame_buffer_info.resolution().1 * out::framebuffer::PIXEL_WIDTH;
     if (payload.frame_buffer_ptr as u64 & (paging::PDPE_MAPPED_SIZE - 1)) + fb_size as u64 > paging::PDPE_MAPPED_SIZE {
         pmap_pdpt[payload.frame_buffer_ptr as usize / paging::PDPE_MAPPED_SIZE as usize + 1] = PTE::PRESENT | PTE::WRITE | PTE::HUGE_PAGE
             | PTE::from_paddr(payload.frame_buffer_ptr as u64 + paging::PDPE_MAPPED_SIZE & !(paging::PDPE_MAPPED_SIZE - 1));
@@ -177,7 +188,7 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
         let uefi_cr3 = CR3::read();
         let uefi_pml4t = unsafe { slice::from_raw_parts_mut(uefi_cr3.get_paddr() as *mut PTE, 512) };
         unsafe { CR0::write(&(CR0::read() & !CR0::WP)); } // UEFI page tables tend to be write-protected
-        uefi_pml4t[RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(uefi_cr3.get_paddr());
+        uefi_pml4t[memman::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(uefi_cr3.get_paddr());
         unsafe { CR0::write(&(CR0::read() | CR0::WP)); } // reset to prevent silent bugs
     }
 
@@ -192,7 +203,7 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
     for phdr in phdr_iter {
         // get physical address of the program segment
 
-        let phys_base = unsafe { *(paging::recur_to_pte(phdr.vaddr(), RECURSIVE_INDEX) as *mut PTE) }.get_paddr();
+        let phys_base = unsafe { *(paging::recur_to_pte(phdr.vaddr(), memman::RECURSIVE_INDEX) as *mut PTE) }.get_paddr();
 
         // remap the program segment
 
@@ -207,7 +218,7 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
         } 
 
         unsafe {
-            map_pages_when_ident(
+            libkernel::memman::map_pages_when_ident(
                 &mut phdr.vaddr().clone(),
                 &mut phys_base.clone(),
                 &mut page_count.clone(), 
@@ -222,11 +233,11 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
 
     // remap the stack
     unsafe {
-        let stack_virt_base = KERNEL_STACK_BOTTOM - KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE;
-        map_pages_when_ident(
+        let stack_virt_base = memman::KERNEL_STACK_BOTTOM - memman::KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE;
+        libkernel::memman::map_pages_when_ident(
             &mut stack_virt_base.clone(),
-            &mut (*(paging::recur_to_pte(stack_virt_base, RECURSIVE_INDEX) as *const PTE)).get_paddr(),
-            &mut KERNEL_STACK_PAGE_COUNT.clone(), 
+            &mut (*(paging::recur_to_pte(stack_virt_base, memman::RECURSIVE_INDEX) as *const PTE)).get_paddr(),
+            &mut memman::KERNEL_STACK_PAGE_COUNT.clone(), 
             PTE::PRESENT | PTE::WRITE, 
             PTE::PRESENT | PTE::WRITE | PTE::NO_EXECUTE, 
             4,
@@ -250,32 +261,44 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
 
     payload.mmap = unsafe {
         slice::from_raw_parts_mut(
-            payload.mmap.as_mut_ptr().cast::<u8>().wrapping_add(PHYS_LADDR_OFFSET as usize).cast(), 
+            payload.mmap.as_mut_ptr().cast::<u8>().wrapping_add(memman::PHYS_LADDR_OFFSET as usize).cast(), 
             core::ptr::metadata(payload.mmap))
     };
     payload.bin = unsafe {
         slice::from_raw_parts(
-            payload.bin.as_ptr().wrapping_add(PHYS_LADDR_OFFSET as usize), 
+            payload.bin.as_ptr().wrapping_add(memman::PHYS_LADDR_OFFSET as usize), 
             core::ptr::metadata(payload.bin))
     };
-    payload.frame_buffer_ptr = payload.frame_buffer_ptr.wrapping_add(PHYS_LADDR_OFFSET as usize);
+    payload.frame_buffer_ptr = payload.frame_buffer_ptr.wrapping_add(memman::PHYS_LADDR_OFFSET as usize);
 
     
     // fix up UEFI system table references and runtime mappings
-    payload.mmap.iter_mut().for_each(|desc| desc.virt_start = desc.phys_start + PHYS_LADDR_OFFSET);
+    payload.mmap.iter_mut().for_each(|desc| desc.virt_start = desc.phys_start + memman::PHYS_LADDR_OFFSET);
 
     
     payload
 }
 
-pub fn alloc_setup() {
-    // choose and map memory span for kernel heap
-    // initialize global allocator
+
+#[global_allocator]
+static mut ALLOCATOR: memman::talloc::Talloc = unsafe { memman::talloc::Talloc::new_invalid() };
+
+pub fn alloc_setup(_payload: &BootPayload) {
+    // todo!
+
+    
+
+    // maybe dont seperate into mapping setup and alloc setup due to tracking memory reservation requirements?
+    // extend this to paging setup? no need, there's a hole in mmem to detect
+
+    // use an allocator to manage physical memory with page-granularity
+    // reserve all the pages that need to be reserved
+    // set up a mapper that uses the pmemallocator to map pages
+
+    // setup the kernel heap allocator somewhere in virtual address space
+    // do a funky dance move
     // profit
 }
-
-
-
 
 
 pub fn segmentation_setup() {
@@ -313,19 +336,3 @@ pub fn segmentation_setup() {
     }
 }
 
-
-
-
-   /*  // the kernel is linked as follows:
-    //   higher half kernel using code-model 'kernel' (see Sys V ABI):
-    //    - lower bound address: 0xffffffff80000000 or 0o177777_777_776_000_000_0000
-    //    - upper bound address: 0xffffffffff000000 or 0o177777_777_777_770_000_0000
-    // thus only PML4E 511, and thereunder, PDPEs 510 and 511 are used
-
-    // create upper kernel mapping pages
-    let pdpt_kn_data = pt_from_getter(&mut get_page);
-    pml4t[511] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pdpt_kn_data.as_ptr() as u64);
-    let pdt_510_kn_data = pt_from_getter(&mut get_page);
-    pdpt_kn_data[510] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pdt_510_kn_data.as_ptr() as u64);
-    let pdt_511_kn_data = pt_from_getter(&mut get_page);
-    pdpt_kn_data[511] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pdt_511_kn_data.as_ptr() as u64); */

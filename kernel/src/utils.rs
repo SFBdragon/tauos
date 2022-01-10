@@ -29,71 +29,58 @@ impl<T> Drop for LlistNode<T> {
         // assume a circular list, which always has an element that isn't removed
         // in the case that this is the last element, this is still safe, as the list is now 'gone'
         unsafe { // Safety: next and prev are both initialized and of the same linked list
-            self.prev.get().as_mut().next.set(self.next.get());
+            self.prev.get().as_ref().next.set(self.next.get());
             self.next.get().as_mut().prev.set(self.prev.get());
         }
     }
 }
 
 impl<T> LlistNode<T> {
-    /// Create a new invalid node.
-    /// # Safety:
-    /// Initialize using `init_llist` before use.
-    #[inline]
-    pub const unsafe fn new_llist_invalid(data: T) -> Self {
-        Self {
-            next: Cell::new(NonNull::dangling()),
-            prev: Cell::new(NonNull::dangling()),
-            data,
-        }
-    }
-    /// Initialize nodes produced by `new_llist_invalid`. Can be used on initialized
-    /// nodes, though it is recommended that they are not a member of a linked list.
-    #[inline]
-    pub fn init_llist(&mut self) {
-        let ptr = self as *mut _;
-        unsafe { // Safety: ptr is safe to deref because self is safe
-            self.next.set(NonNull::new_unchecked(ptr));
-            self.next.set(NonNull::new_unchecked(ptr));
-        }
-    }
-
-    
     /// Create a new independent node in place.
-    /// # Safety:
-    /// `self.data` must *not* rely upon being dropped - it will be overwritten.
+    /// 
+    /// Note that this will not call `data`'s drop code. 
+    /// It is your responsibility to make sure `node`'s `data` gets dropped if necessary.
     #[inline]
-    pub unsafe fn new_llist(node: &mut MaybeUninit<Self>, data: T) {
-        *node = MaybeUninit::new(Self {
-            prev: Cell::new(NonNull::dangling()),
-            next: Cell::new(NonNull::dangling()),
+    pub const fn new_llist(node: &'_ mut MaybeUninit<Self>, data: T) -> &'_ mut Self {
+        // SAFETY: node is a valid reference, thus the resulting pointer is valid and dereferencable
+        let node_ptr = unsafe { NonNull::new_unchecked(node as *mut _ as *mut Self) };
+
+        let initd_node = node.write(Self {
+            prev: Cell::new(node_ptr),
+            next: Cell::new(node_ptr),
             data,
         });
-        node.assume_init_ref().prev.set(node.assume_init_ref().into());
-        node.assume_init_ref().next.set(node.assume_init_ref().into());
+
+        initd_node
     }
 
-    /// Create a new node as a member of an existing linked list in place of `ptr`.
+    /// Create a new node as a member of an existing linked list in place of `node`.
     /// 
-    /// `ptr`'s value is not expected to be initialized.
+    /// `prev` and `next` should belong to the same linked list, 
+    /// as not doing do may cause complex and unexpected linkages.
+    /// 
+    /// Note that this will not call `data`'s drop code. 
+    /// It is your responsibility to make sure `data` gets dropped if necessary.
     /// # Safety:
-    /// * `prev` and `next` must be initialized
-    /// * `prev` and `next` must belong to the same linked list.
+    /// * `next` and `prev` must be dereferencable and initialized
     #[inline]
-    pub unsafe fn new(mut ptr: NonNull<Self>, prev: NonNull<Self>, next: NonNull<Self>, data: T) {
-        *ptr.as_uninit_mut() = MaybeUninit::new(Self { 
-            prev: Cell::new(prev.into()),
-            next: Cell::new(next.into()),
+    pub unsafe fn new(node: &'_ mut MaybeUninit<Self>, prev: NonNull<Self>, next: NonNull<Self>, data: T)
+    -> &'_ mut Self {
+        let initd_node = node.write(Self { 
+            prev: Cell::new(prev),
+            next: Cell::new(next),
             data,
         });
 
-        next.as_ref().prev.set(ptr);
-        prev.as_ref().next.set(ptr);
+        (*next.as_ptr()).prev.set(initd_node.into());
+        (*prev.as_ptr()).next.set(initd_node.into());
+
+        initd_node
     }
 
     /// Remove `node` from its linked list.
     #[inline]
-    pub fn remove(node: NonNull<Self>) {
+    pub fn remove(node: NonNull<LlistNode<T>>) {
         unsafe {
             core::ptr::drop_in_place(node.as_ptr());
         }
@@ -127,47 +114,67 @@ impl<T> LlistNode<T> {
         prev.as_ref().next.set(start);
         next.as_ref().prev.set(end);
     }
+
+    pub fn iter<'llist>(&mut self) -> Iter<'llist, T> {
+        Iter::new(self.into())
+    }
 }
 
-pub struct LlistNodeIter<'llist, T> {
-    forward: NonNull<LlistNode<T>>,
-    backward: NonNull<LlistNode<T>>,
+
+/// An iterator over the circular linked list `LlistNode`s, excluding the 'head'.
+///
+/// This `struct` is created by [`LinkedList::iter()`]. See its
+/// documentation for more.
+#[derive(Debug, Clone, Copy)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<'llist, T: 'llist> {
+    sentinel: NonNull<LlistNode<T>>,
+    next_forward: NonNull<LlistNode<T>>,
+    next_backward: NonNull<LlistNode<T>>,
+    prior_overlap: bool,
     _phantom: PhantomData<&'llist ()>,
 }
 
-impl<'llist, T: 'llist> Iterator for LlistNodeIter<'llist, T> {
+impl<'llist, T> Iterator for Iter<'llist, T> {
     type Item = &'llist mut LlistNode<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut next_forward = unsafe { self.forward.as_ref() }.next.get();
-        if next_forward == self.backward {
+        if self.prior_overlap || self.next_forward == self.sentinel {
             None
+        } else if self.next_forward == self.next_backward {
+            self.prior_overlap = true;
+            Some(unsafe { self.next_forward.as_mut() })
         } else {
-            self.forward = next_forward;
-            Some(unsafe { next_forward.as_mut() })
+            let next_forward = unsafe { self.next_forward.as_mut() };
+            self.next_forward = unsafe { self.next_forward.as_ref() }.next.get();
+            Some(next_forward)
         }
     }
 }
 
-impl<'llist, T: 'llist> DoubleEndedIterator for LlistNodeIter<'llist, T> {
+impl<'llist, T> DoubleEndedIterator for Iter<'llist, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let mut next_backward = unsafe { self.backward.as_ref() }.prev.get();
-        if next_backward == self.forward {
+        if self.prior_overlap || self.next_backward == self.sentinel {
             None
+        } else if self.next_forward == self.next_backward {
+            self.prior_overlap = true;
+            Some(unsafe { self.next_backward.as_mut() })
         } else {
-            self.backward = next_backward;
-            Some(unsafe { next_backward.as_mut() })
+            let next_backward = unsafe { self.next_backward.as_mut() };
+            self.next_backward = unsafe { self.next_backward.as_ref() }.prev.get();
+            Some(next_backward)
         }
     }
 }
 
-impl<'llist, T: 'llist> LlistNodeIter<'llist, T> {
-    pub fn new(head: NonNull<LlistNode<T>>) -> Self {
-        Self {
-            forward: head,
-            backward: head,
+impl<'llist, T> Iter<'llist, T> {
+    fn new(sentinel: NonNull<LlistNode<T>>) -> Self {
+        Iter {
+            sentinel,
+            next_backward: unsafe { sentinel.as_ref() }.prev.get(),
+            next_forward: unsafe { sentinel.as_ref() }.next.get(),
+            prior_overlap: false,
             _phantom: PhantomData,
         }
     }
 }
-

@@ -1,7 +1,7 @@
 # just + python build scripts
 
 arch          := 'x86_64'
-config        := 'release'
+config        := 'debug'
 
 workspace_dir := justfile_directory()
 target_dir    := join(workspace_dir, 'target')
@@ -58,7 +58,7 @@ _build-check mode: validate
     import subprocess
     import shutil
 
-    # os.environ['RUSTFLAGS'] = ''
+    os.environ['RUSTFLAGS'] = ''
 
     # bl:
     bl_build_command = r"cargo +nightly {{mode}} --package bl --target {{bl_target}} " \
@@ -126,8 +126,8 @@ run: build
     #    r"-drive format=raw,file=fat:rw:{{'kpart_dir'}} "
 
     if "{{arch}}" == "x86_64":
-        qemu_flags = qemu_flags + "-machine q35 -cpu max -smp 4 -m 2G " + \
-            "-device isa-debug-exit,iobase=0xf4,iosize=0x04 " #+ \
+        qemu_flags = qemu_flags + "-machine q35 -cpu max -smp 4 -m 2G "# + \
+            #"-device isa-debug-exit,iobase=0xf4,iosize=0x04 " #+ \
             #"-S -s "
             # "-enable-kvm "
 

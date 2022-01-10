@@ -214,7 +214,7 @@ fn load_elf_kernel(st: &mut SystemTable<Boot>, elf_data: &[u8]) -> u64 {
                 .expect_success("failed to allocate pages for kernel map");
 
             unsafe {
-                libkernel::mem::map_pages_when_ident(
+                libkernel::memman::map_pages_when_ident(
                     &mut phdr.vaddr().clone(),
                     &mut segment_phys_base.clone(),
                     &mut page_count.clone(), 
@@ -244,7 +244,7 @@ fn load_elf_kernel(st: &mut SystemTable<Boot>, elf_data: &[u8]) -> u64 {
 }
 
 fn stack_setup(st: &mut SystemTable<Boot>) {
-    use libkernel::mem::{KERNEL_STACK_BOTTOM, KERNEL_STACK_PAGE_COUNT};
+    use libkernel::memman::{KERNEL_STACK_BOTTOM, KERNEL_STACK_PAGE_COUNT};
 
     let phys_base = alloc_payload_data(st, (KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE) as usize);
 
@@ -256,7 +256,7 @@ fn stack_setup(st: &mut SystemTable<Boot>) {
         let pml4t = slice::from_raw_parts_mut(CR3::read().get_paddr() as *mut PTE, 512);
 
         let stack_virt_base = KERNEL_STACK_BOTTOM - KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE;
-        libkernel::mem::map_pages_when_ident(
+        libkernel::memman::map_pages_when_ident(
             &mut stack_virt_base.clone(),
             &mut phys_base.clone(),
             &mut KERNEL_STACK_PAGE_COUNT.clone(), 
@@ -268,4 +268,3 @@ fn stack_setup(st: &mut SystemTable<Boot>) {
         );
     }
 }
-
