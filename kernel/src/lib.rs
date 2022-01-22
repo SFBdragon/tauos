@@ -6,8 +6,10 @@
 #![feature(ptr_metadata)]
 #![feature(ptr_as_uninit)]
 
+#![feature(const_pin)]
 #![feature(const_mut_refs)]
 #![feature(const_maybe_uninit_write)]
+#![feature(const_maybe_uninit_as_ptr)]
 #![feature(const_slice_from_raw_parts)]
 #![feature(const_maybe_uninit_assume_init)]
 

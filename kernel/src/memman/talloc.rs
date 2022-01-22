@@ -1,9 +1,9 @@
 use core::{
     ptr::{self, NonNull},
-    alloc::{GlobalAlloc, Layout}, ops::Range, mem::MaybeUninit,
+    alloc::{GlobalAlloc, Layout}, ops::Range, mem::MaybeUninit, pin::Pin,
 };
 use amd64::paging;
-use crate::utils::LlistNode;
+use crate::utils::llist::LlistNode;
 use spin::Mutex;
 
 
@@ -86,12 +86,11 @@ impl ArenaConfig {
         // ensure none of the fields are zero
         assert!(self.base != 0, "ArenaConfig with a base of zero is invalid.");
         assert!(self.size != 0, "ArenaConfig with a size of zero is invalid.");
-
-        // 
-        
         // ensure granularity is within expected bounds
         assert!(self.smlst_log2 > 3,
             "ArenaConfig with an allocatable block smaller than 16 bytes is invalid.");
+
+        
 
         // ensure size does not contain unusable space:
         // no bits pertaining to blocks smaller than smallest allocatable are set
@@ -122,10 +121,9 @@ impl ArenaConfig {
     }
 
     /// Returns the required length of the `llists` `slice` in terms of `u64`.
-    /// This value, also referred to as 'g'/'G', is the `maximum granularity of the arena
-    /// plus one`, see `Talloc` docs for more info.
+    /// This value is the `maximum granularity of the arena plus one`, see `Talloc` type-level docs for more info.
     /// 
-    /// Validation checks `self`
+    /// Validation checks `self`.
     #[inline]
     pub const fn llists_len(&self) -> usize {
         self.validate();
@@ -133,9 +131,9 @@ impl ArenaConfig {
         (64 - self.smlst_log2 - self.size.leading_zeros()) as usize
     }
 
-    /// Returns the required length of the `bitmap` `slice` in terms of `u64`.
+    /// Returns the required length of the `bitmap` slice in terms of `u64`.
     /// 
-    /// Validation checks `self`
+    /// Validation checks `self`.
     #[inline]
     pub const fn bitmap_len(&self) -> usize {
         let bits = 1 << self.llists_len(); // validation checks
@@ -146,6 +144,7 @@ impl ArenaConfig {
         }
     }
 }
+
 
 /// The bookkeeping `struct` for tracking `Talloc`s state:
 /// * `bitmap` a bitmap describing occupation of memopry blocks in the arena,
@@ -159,8 +158,8 @@ struct TallocBooks<'a> {
     /// offset from the base by that width in bits. Where digits represent each bit for a certain
     /// granularity: `01223333_44444444_55555555_55555555 ...` and so on. Buddies are represented from
     /// low addresses to high addresses.
-    /// * Clear bit indicates homogeneity: either both are allocated or neither.
-    /// * Set bit indicated heterogeneity: one of the pair is allocated.
+    /// * Clear bit indicates homogeneity: both or neither are allocated.
+    /// * Set bit indicated heterogeneity: one buddy is allocated.
     bitmap: &'a mut [u64],
     /// The sentinels of the linked lists that each hold available blocks per index/granularity.
     llists: &'a mut [LlistNode<()>],
@@ -186,11 +185,12 @@ impl<'a> TallocBooks<'a> {
 
     /// Registers a block into the books, making it available for allocation.
     /// # Safety:
-    /// * `bitmap_offset`'s source `size` and `position` must agree withd
+    /// * `bitmap_offset`'s source `size` and `position` must agree with
     /// `granularity`'s block size and `node`'s block base and size.
-    /// * `node` must be aligned and dereferencable, though it needn't be initialized.
+    /// * `node` must be aligned, dereferencable, and not mutably aliased, though it needn't be initialized.
+    /// * The granularities's sentinel, and the sentinel's next node, must not be mutably referenced.
     #[inline]
-    unsafe fn add_block(&mut self, granularity: usize, bitmap_offset: u64, mut node: NonNull<LlistNode<()>>) {
+    unsafe fn add_block(&mut self, granularity: usize, bitmap_offset: u64, node: Pin<&mut MaybeUninit<LlistNode<()>>>) {
         if self.avails & 1 << granularity == 0 {
             // populating llist
             self.avails |= 1 << granularity;
@@ -198,9 +198,11 @@ impl<'a> TallocBooks<'a> {
 
         // add node from llist
         let sentinel = self.llists.get_unchecked_mut(granularity);
-        LlistNode::new(node.as_uninit_mut(), 
-            sentinel.into(),
-            sentinel.next.get(),
+        LlistNode::new(
+            node, 
+            sentinel,
+            // SAFETY: sentinel is not moved
+            Pin::new_unchecked(sentinel).next().as_ref().get_ref(),
             ()
         );
 
@@ -211,21 +213,24 @@ impl<'a> TallocBooks<'a> {
     /// # Safety:
     /// * `bitmap_offset`'s source `size` and `position` must agree with
     /// `granularity`'s block size and `node`'s block base and size.
-    /// * `node` must be aligned and dereferencable, though it needn't be initialized.
+    /// * `node` must be aligned, dereferencable, and not mutably aliased, though it needn't be initialized.
+    /// * `node`'s neighbours must not be mutably referenced.
+    /// * The granularities's sentinel, and the sentinel's next node, must not be mutably referenced.
     #[inline]
-    unsafe fn remove_block(&mut self, granularity: usize, bitmap_offset: u64, node: NonNull<LlistNode<()>>) {
-        if node.as_ref().next.get() == node.as_ref().prev.get() {
+    unsafe fn remove_block(&mut self, granularity: usize, bitmap_offset: u64, node: Pin<&mut LlistNode<()>>) {
+        if ptr::eq(node.next().as_ref().get_ref(), node.prev().as_ref().get_ref()) {
             // last block in llist, toggle off avl flag
             self.avails &= !(1 << granularity);
         }
 
         // remove node from llist
-        LlistNode::remove(node);
+        node.remove();
 
         // toggle bitmap flag
         self.toggle_bitflag(bitmap_offset);
     }
 }
+
 
 /// ## Interface documentation:
 /// 
@@ -292,20 +297,14 @@ impl<'a> TallocBooks<'a> {
 /// A granularity of one is the virtual size split into two halves - a single buddy, thus requiring
 /// one bit in the bitmap, and so on.
 ///
-/// - G/g: This represents the maximum granularity + 1, and is equal to llists.len(), as well as the
-/// base 2 log of the bitmap size in bits. Largest block size >> (g + 1) == smallest. This is an
+/// - `llists.len()`: This represents the maximum granularity + 1, and is equal to the log base 2
+/// of the bitmap size in bits. `largest block size >> (llists.len() - 1) == smallest`. This is an
 /// important value for the contruction of the allocator, but is abstract and error-prone to 
-/// calculate, hence the reason for AllocConfig's existence, as well as for the transparency of the
+/// calculate, hence a reason for `AllocConfig`'s existence, as well as for the transparency of the
 /// arena shrinking process to satisfy the above alignment constraint (as well as remove unallocatable
 /// space within the arena), as hiding that behaviour may cause unexpected results for users.
-
 #[derive(Debug)]
 pub struct Talloc<'a> {
-    /// Identical in meaning to `G`, as the `maximum granularity + 1`, however
-    /// `g` can be smaller than `G`, allowing granularity determination at runtime.
-    /// This is especially useful when the size of the arena is not know at compile time.
-    g: usize,
-
     /// The base of the arena, a casted pointer.
     base: u64,
     /// Size of the arena in bytes.
@@ -332,11 +331,10 @@ pub struct Talloc<'a> {
 impl<'a> Talloc<'a> {
     /// Creates an invalid `Talloc` that can act as an uninitialized value.
     /// 
-    /// # Safety:
+    /// # Safety: todo fixme
     /// Replace before use. Calling any methods on the result is undefined behaviour.
     pub const unsafe fn new_invalid() -> Self {
         Self {
-            g: 0,
             base: 0,
             size: 0,
             lrgst: 0,
@@ -354,64 +352,52 @@ impl<'a> Talloc<'a> {
         }
     }
 
-    /// Create the allocator, but leave it not fully initialized.
-    /// Use the `ArenaConfig` type to help create a valid arena and bitmap.
-    /// 
-    /// This function does not touch the arena itself, and leaves the arena as reserved.
-    /// Use the `release` or `release_arena` functions to establish allocatable memory.
+    /// todo fixme
     /// 
     /// # Safety:
-    /// The result is only valid to have `const_init(...)` called on it.
-    pub const unsafe fn const_new(config: ArenaConfig) -> Self {
-        let llists_len = config.llists_len(); // .g() validates config
-        // Ensure g is supported
-        assert!(64 >= llists_len, "g (max granularity + 1) > 64 is unsupported. Read type-level docs for more info.");
+    /// Reinitializing an arena that has currently allocated memory may cause memory unsafety or UB.
+    /// 
+    /// Initializes `books` to an invalid state, thus calling `init_books(...)` before use is necessary.
+    pub const unsafe fn init_arena(&mut self, config: ArenaConfig) {
+        config.validate();
 
-        // Construct new and return
-        Self {
-            g: llists_len,
-            base: config.base,
-            size: config.size,
-            lrgst: 1 << config.size.log2(),
-            smlst: 1 << config.smlst_log2,
-            virt_size: config.size.next_power_of_two(),
-            virt_base: {
-                let req_align = config.req_align();
-                if config.base.trailing_zeros() >= req_align {
-                    config.base
-                } else {
-                    (config.base + config.size).wrapping_sub(config.size.next_power_of_two())
-                }
-            },
-            books: Mutex::new(
-                TallocBooks {
-                    bitmap: core::slice::from_raw_parts_mut(NonNull::dangling().as_ptr(), 0),
-                    llists: core::slice::from_raw_parts_mut(NonNull::dangling().as_ptr(), 0),
-                    avails: 0,
-                }
-            ),
-        }
+        self.base = config.base;
+        self.size = config.size;
+        self.lrgst = 1 << config.size.log2();
+        self.smlst = 1 << config.smlst_log2;
+        self.virt_size = config.size.next_power_of_two();
+        self.virt_base = {
+            let req_align = config.req_align();
+            if config.base.trailing_zeros() >= req_align {
+                config.base
+            } else {
+                (config.base + config.size).wrapping_sub(config.size.next_power_of_two())
+            }
+        };
     }
 
-    /// Initializes an allocator contructed using `const_new`.
-    /// 
-    /// This function does not touch the arena itself, and leaves the arena as reserved.
-    /// Use the `release` or `release_arena` functions to establish allocatable memory.
-    /// 
+    /// Initializes the books of the arena to the all-reserved memory state.
     /// # Safety:
-    /// This is only valid to be called on the result of `const_new`.
-    pub unsafe fn const_init(&mut self, bitmap: &mut [MaybeUninit<u64>], llists: &mut [MaybeUninit<LlistNode<()>>]) {
-        // Ensure g is supported
-        assert!(64 >= self.g, "g (max granularity + 1) > 64 is unsupported. Read type-level docs for more info.");
-        // Ensure llists length is correct
-        assert!(llists.len() == self.g, "config.g() should equal llists.len(). Read type-level docs for more info.");
-        // Ensure bitmap length is correct
-        assert!(bitmap.len() >= 1 && bitmap.len() >= 1 << (self.g - 3),
-            "bitmap.len() should equal config.bitmap_len(). Read type-level docs for more info.");
+    /// Reinitializing the books of an arena that has currently allocated memory may cause memory unsafety or UB.
+    pub unsafe fn init_books(&mut self, bitmap: &mut [MaybeUninit<u64>], llists: &mut [MaybeUninit<LlistNode<()>>]) {
+        let mut books = self.books.lock();
+
+        // Extract slice length requirement from arena data
+        let llists_len = (64 - self.smlst.log2() - self.size.leading_zeros()) as usize;
+
+        // Ensure slice lengths correspond to expected values
+        assert!(llists.len() == llists_len,
+            "llists.len() should equal to the arena used for initialization's ArenaConfig::llists_len().");
+        assert!(bitmap.len() >= 1 && bitmap.len() >= 1 << llists_len >> 3,
+            "bitmap.len() should equal to the arena used for initialization's ArenaConfig::bitmap_len().");
 
         // Initialize the contents of bitmap and llists
         bitmap.fill(MaybeUninit::new(0));
-        for node in llists.iter_mut() { LlistNode::new_llist(node, ()); }
+        for node in llists.iter_mut() {
+            // SAFETY: llists' nodes are never moved
+            LlistNode::new_llist(Pin::new_unchecked(node), ());
+        }
+
         // Transmute the references to the data to reflect their initialization
         let (initd_bitmap, initd_llists) = (
             // SAFETY: both memory spans were just initialized
@@ -420,30 +406,32 @@ impl<'a> Talloc<'a> {
         );
 
         // Configure the books
-        let mut books = self.books.lock();
         books.bitmap = initd_bitmap;
         books.llists = initd_llists;
         books.avails = 0;
     }
 
-    /// Create and initialize the allocator. Use the `ArenaConfig` type to help create a valid arena and bitmap.
+   /*  /// Create and initialize the allocator. Use the `ArenaConfig` type to help create a valid arena and bitmap.
     /// 
     /// This function does not touch the arena itself, and leaves the arena as reserved.
     /// Use the `release` or `release_arena` functions to establish allocatable memory.
     pub fn dyn_new(config: ArenaConfig, bitmap: &mut [MaybeUninit<u64>], llists: &mut [MaybeUninit<LlistNode<()>>])
     -> Self {
-        let g = config.llists_len(); // .g() validates config
+        let llists_len = config.llists_len(); // .llists_len() validates config
         // Ensure g is supported
-        assert!(64 >= g, "g (max granularity + 1) > 64 is unsupported. Read type-level docs for more info.");
+        assert!(llists.len() <= 64, "llists.len()/'g' > 64 is unsupported. Read type-level docs for more info.");
         // Ensure llists length is correct
-        assert!(llists.len() == g, "config.g() should equal llists.len(). Read type-level docs for more info.");
+        assert!(llists.len() == llists_len, "config.llists_len() must equal llists.len().");
         // Ensure bitmap length is correct
-        assert!(bitmap.len() >= config.bitmap_len(),
-            "bitmap.len() should equal config.bitmap_len(). Read type-level docs for more info.");
+        assert!(bitmap.len() >= config.bitmap_len(), "bitmap.len() should equal config.bitmap_len().");
 
         // Initialize the contents of bitmap and llists
         bitmap.fill(MaybeUninit::new(0));
-        for node in llists.iter_mut() { LlistNode::new_llist(node, ()); }
+        for node in llists.iter_mut() {
+            // SAFETY: llists' nodes are never moved
+            LlistNode::new_llist(unsafe { Pin::new_unchecked(node) }, ());
+        }
+
         // Transmute the references to the data to reflect their initialization
         let (initd_bitmap, initd_llists) = unsafe { (
             // SAFETY: both memory spans were just initialized
@@ -453,7 +441,6 @@ impl<'a> Talloc<'a> {
 
         // Construct new and return
         Self {
-            g,
             base: config.base,
             size: config.size,
             lrgst: 1 << config.size.log2(),
@@ -476,7 +463,8 @@ impl<'a> Talloc<'a> {
             ),
         }
     }
-
+ */
+    
     #[inline]
     fn block_granularity(&self, size: u64) -> usize {
         // effectively computing: largest_block_size.log2() - virt_size.log2()
@@ -540,22 +528,29 @@ impl<'a> Talloc<'a> {
 
         let mut books = self.books.lock();
 
+        let smlst_granularity = books.llists.len() - 1;
         let mut block_size = self.lrgst;
-        for granularity in 0..(self.g - 1) { // do not apply to the granularity of the smallest blocks
-            for node in books.llists[granularity].iter() {
-                let block_base = node as *mut _ as u64;
+        for granularity in 0..smlst_granularity { // do not apply to the granularity of the smallest blocks
+            for node in Pin::new_unchecked(
+            books.llists.get_mut(granularity).unwrap()).iter_mut() {
+
+                let block_base = unsafe {
+                    // SAFETY: reference and pointer is not moved out of or into
+                    node.get_unchecked_mut()
+                } as *mut _ as u64;
                 let block_acme = block_base + block_size;
+                
                 if span.start < block_base && span.end >= block_acme {
                     // this block is entirely reserved and should be removed as if it were allocated
-                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node.into());
+                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node);
                 } else if span.start == block_base && span.end == block_acme {
                     // block represents the entire reserved area - remove and return
-                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node.into());
+                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node);
                     return;
                 } else if span.start >= block_base && span.start < block_acme
                 || span.end > block_base && span.end <= block_acme {
                     // block contains lo_end or hi_end - break it down
-                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node.into());
+                    books.remove_block(granularity, self.bitmap_offset(block_base, block_size), node);
 
                     let half_size = block_size / 2;
                     books.add_block(granularity + 1, self.bitmap_offset(block_base, half_size), 
@@ -569,14 +564,21 @@ impl<'a> Talloc<'a> {
         
         // now eliminate all remaining smallest blocks as necessary,
         // with confidence that the elimination will never over-eliminate
-        for node in books.llists[self.g - 1].iter() {
-            let block_base = node as *mut _ as u64;
-            if span.start < block_base + self.smlst && span.end > block_base {
+        for node in Pin::new_unchecked(
+        books.llists.get_mut(smlst_granularity).unwrap()).iter_mut() {
+            
+            let block_base = unsafe {
+                // SAFETY: reference and pointer is not moved out of or into
+                node.get_unchecked_mut()
+            } as *mut _ as u64;
+            let block_acme = block_base + self.smlst;
+
+            if span.start < block_acme && span.end > block_base {
                 // this block is reserved and should be removed as if it were allocated
                 books.remove_block(
-                    self.g - 1,
+                    smlst_granularity,
                     self.bitmap_offset(block_base, self.smlst),
-                    node.into()
+                    node
                 );
             }
         }
@@ -589,7 +591,7 @@ impl<'a> Talloc<'a> {
     /// The memory span must be entirely reserved.
     pub unsafe fn release(&self, span: Range<u64>) {
         /* Strategy:
-            Essentially, the opposite process to reserve() is applied. While deallocating eath small block
+            Essentially, the opposite process to reserve() is applied. While deallocating each small block
             in the span is simple and correct, it is slow. Thus a routine to combine them automatically
             within the span is employed. Deallocating is still necessary, as the blocks being made available
             may need to be recombined with buddies outside of the span.
@@ -653,6 +655,7 @@ impl<'a> Talloc<'a> {
         let is_base_aligned = self.base == self.virt_base;
         let mut offset_base = if is_base_aligned { self.base } else { self.base + self.size };
         let mut arena_size_bitmap = self.size;
+
         while arena_size_bitmap != 0 {
             // SAFETY: just guaranteed that arena_size_bitmap is nonzero
             let block_size = fast_non0_prev_pow2(arena_size_bitmap);
@@ -670,6 +673,29 @@ impl<'a> Talloc<'a> {
 
             if is_base_aligned { offset_base += block_size; }
         }
+    }
+
+    ///
+    /// 
+    /// # Safety:
+    /// * Must not exclude avail or allocd mem
+    pub unsafe fn resize_arena(&mut self, config: ArenaConfig,
+    bitmap: &mut [MaybeUninit<u64>], llists: &mut [MaybeUninit<LlistNode<()>>]) {
+        // check that smallest blocks are compatible
+
+        // SAFETY: User guarantees that todo
+        self.init_arena(config);
+        // SAFETY: books are immediately hereafter locked and available memory references are restored
+        self.init_books(bitmap, llists);
+
+        let books = self.books.lock();
+
+        // set/shift avails accordingly
+        // set llists and fix moved nodes
+        // move bitmap data over
+        // ensure any pairs with new data are correct? (should already be correct?)
+
+        todo!()
     }
 }
 
@@ -689,7 +715,7 @@ unsafe impl<'a> GlobalAlloc for Talloc<'a> {
         let granularity = self.block_granularity(size);
 
         if books.avails & 1 << granularity != 0 { // if a block of size is available, allocate it
-            let next = books.llists.get_unchecked_mut(granularity).next.get();
+            let next = books.llists.get_unchecked_mut(granularity).next();
             books.remove_block(granularity, self.bitmap_offset(next.as_ptr() as u64, size), next);
             return next.as_ptr().cast();
         }
@@ -700,7 +726,7 @@ unsafe impl<'a> GlobalAlloc for Talloc<'a> {
         
         let lgr_granularity = fast_non0_log2(larger_avl) as usize;
         let lgr_size = self.lrgst >> lgr_granularity;
-        let lgr_block = books.llists.get_unchecked_mut(lgr_granularity).next.get();
+        let lgr_block = books.llists.get_unchecked_mut(lgr_granularity).next();
         
         // remove the large block, it is guaranteed to be broken
         books.remove_block(
