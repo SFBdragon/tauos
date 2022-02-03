@@ -1,6 +1,6 @@
 //! Module containing segmentation related instructions, structures, interface, etc.
 
-use core::mem::{size_of, MaybeUninit};
+use core::{arch::asm, mem::{size_of, MaybeUninit}};
 
 use super::{PriviledgeLevel, interrupts::Ssdt};
 

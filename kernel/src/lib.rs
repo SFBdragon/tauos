@@ -1,15 +1,21 @@
 #![no_std]
 
-#![feature(asm)]
+#![feature(allocator_api)]
 #![feature(int_log)]
+#![feature(int_abs_diff)]
+#![feature(arbitrary_self_types)]
 
 #![feature(ptr_metadata)]
 #![feature(ptr_as_uninit)]
 
+#![feature(slice_ptr_len)]
+#![feature(slice_ptr_get, nonnull_slice_from_raw_parts)]
+#![feature(maybe_uninit_slice)]
+#![feature(maybe_uninit_write_slice)]
+
 #![feature(const_pin)]
 #![feature(const_mut_refs)]
 #![feature(const_maybe_uninit_write)]
-#![feature(const_maybe_uninit_as_ptr)]
 #![feature(const_slice_from_raw_parts)]
 #![feature(const_maybe_uninit_assume_init)]
 

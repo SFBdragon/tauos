@@ -529,13 +529,13 @@ pub struct InterruptDesciptorTable {
 /// Disable Interrupts
 pub fn cli() {
     unsafe {
-        asm!("cli", options(nostack, nomem, preserves_flags));
+        core::arch::asm!("cli", options(nostack, nomem, preserves_flags));
     }
 }
 /// Enable Interrupts
 pub fn sti() {
     unsafe {
-        asm!("sti", options(nostack, nomem, preserves_flags));
+        core::arch::asm!("sti", options(nostack, nomem, preserves_flags));
     }
 }
 /// Enable Interrupts and Halt
@@ -543,7 +543,7 @@ pub fn sti() {
 /// Useful for preventing race conditions between interrupts and a hlt.
 pub fn sti_hlt() {
     unsafe {
-        asm!("sti; hlt", options(nostack, nomem, preserves_flags)); 
+        core::arch::asm!("sti; hlt", options(nostack, nomem, preserves_flags)); 
     }
 }
 
@@ -565,7 +565,7 @@ pub unsafe fn lidt(idt: *const InterruptDesciptorTable) {
 /// * loading this IDT is safe
 pub unsafe fn lidt_raw(limit: u16, base: *const InterruptDesciptorTable) {
     let dto = DescriptorTableOp { limit, base: base as u64 };
-    asm!("lidt [{}]", in(reg) &dto, options(readonly, nostack, preserves_flags));
+    core::arch::asm!("lidt [{}]", in(reg) &dto, options(readonly, nostack, preserves_flags));
 }
 
 /// Store Interrupt Descriptor Table (read from IDTR)
@@ -583,7 +583,7 @@ pub fn sidt_raw() -> (u16, *mut InterruptDesciptorTable) {
     let mut dto: MaybeUninit<DescriptorTableOp> = MaybeUninit::uninit();
 
     unsafe {
-        asm!("sidt [{}]", in(reg) &mut dto, options(nostack, preserves_flags));
+        core::arch::asm!("sidt [{}]", in(reg) &mut dto, options(nostack, preserves_flags));
     }
 
     let dto = unsafe { dto.assume_init() };
@@ -592,13 +592,13 @@ pub fn sidt_raw() -> (u16, *mut InterruptDesciptorTable) {
 
 /// Load Task Register
 pub unsafe fn ltr(selector: SegmentSelector) {
-    asm!("ltr {:x}", in(reg) selector.0, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("ltr {:x}", in(reg) selector.0, options(nomem, nostack, preserves_flags));
 }
 /// Store Task Register
 pub fn str() -> SegmentSelector {
     let selector: u16;
     unsafe {
-        asm!("ltr {:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("ltr {:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
     }
     SegmentSelector(selector)
 }

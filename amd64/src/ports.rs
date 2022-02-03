@@ -8,13 +8,13 @@ use core::{marker::PhantomData, fmt};
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
 pub unsafe fn outb(port: u16, data: u8) {
-    asm!("out dx, al", in("dx") port, in("al") data, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("out dx, al", in("dx") port, in("al") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
 pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
-    asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
 }
 /// # Safety:
@@ -22,13 +22,13 @@ pub unsafe fn inb(port: u16) -> u8 {
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
 pub unsafe fn outs(port: u16, data: u16) {
-    asm!("out dx, ax", in("dx") port, in("ax") data, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("out dx, ax", in("dx") port, in("ax") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
 pub unsafe fn ins(port: u16) -> u16 {
     let value: u16;
-    asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
 }
 /// # Safety:
@@ -36,13 +36,13 @@ pub unsafe fn ins(port: u16) -> u16 {
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
 pub unsafe fn outi(port: u16, data: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") data, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("out dx, eax", in("dx") port, in("eax") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
 pub unsafe fn ini(port: u16) -> u32 {
     let value: u32;
-    asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    core::arch::asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
 }
 

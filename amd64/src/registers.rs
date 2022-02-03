@@ -1,5 +1,6 @@
 //! Interaction and access to some common x86-64 registers.
 
+use core::arch::asm;
 
 pub const EFER_MSR: u64 = 0xC0000080;
 

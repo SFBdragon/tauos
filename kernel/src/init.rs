@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(asm)]
 #![feature(ptr_metadata)]
 #![feature(alloc_error_handler)]
 
@@ -25,7 +24,7 @@ pub extern "sysv64" fn _start(payload: BootPayload) -> ! {
 
         // switch the stacks onto loader pre-allocated stack area
         // mem::KERNEL_STACK_BOTTOM itself is unmapped, thus reduce by sixteen (preserves alignment)
-        asm!("mov rsp, {}", in(reg) memman::KERNEL_STACK_BOTTOM - 0x10, options(preserves_flags));
+        core::arch::asm!("mov rsp, {}", in(reg) memman::KERNEL_STACK_BOTTOM - 0x10, options(preserves_flags));
     };
 
     // jump to init immediately; don't touch the stack
@@ -54,11 +53,11 @@ fn init() -> ! {
     }
 
     
-    let payload = paging_setup(payload);
+    let payload = unsafe { paging_setup(payload) };
     
     unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
 
-    alloc_setup(&payload); // todo
+    unsafe { alloc_setup(&payload); } // todo
 
     println!("here8");
     amd64::hlt_loop();
@@ -97,8 +96,9 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 }
 
 
-
-pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
+/// # Safety:
+/// Do not call twice. Assumes UEFI- & OS loader-defined handoff state.
+pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
 
     /*                                     SET UP PAGING
     Goals:
@@ -279,11 +279,19 @@ pub fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
     payload
 }
 
-
+/* 
 #[global_allocator]
-static mut ALLOCATOR: memman::talloc::Talloc = unsafe { memman::talloc::Talloc::new_invalid() };
+static mut ALLOCATOR: memman::talloc::Talloc = unsafe { 
+    let x = memman::talloc::Talloc::new_invalid();
+    x.init_arena(base, size, smallest_allocatable_size);
+    x
+};
 
-pub fn alloc_setup(_payload: &BootPayload) {
+static mut MAPPER: map = unsafe { map }; */
+
+/// # Safety:
+/// Do not call twice. Assumes allocators have yet to be initialized.
+pub unsafe fn alloc_setup(_payload: &BootPayload) {
     // todo!
 
     
@@ -295,9 +303,13 @@ pub fn alloc_setup(_payload: &BootPayload) {
     // reserve all the pages that need to be reserved
     // set up a mapper that uses the pmemallocator to map pages
 
-    // setup the kernel heap allocator somewhere in virtual address space
-    // do a funky dance move
-    // profit
+
+   /*  unsafe {
+        ALLOCATOR.init_books( // fixme: use the mapper
+            slice::from_raw_parts_mut(data, ALLOCATOR.llists_len()),
+            slice::from_raw_parts_mut(data, ALLOCATOR.bitmap_len())
+        );
+    } */
 }
 
 

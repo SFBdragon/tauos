@@ -132,7 +132,7 @@ fn alloc_payload_data(st: &mut SystemTable<Boot>, size_at_least: usize) -> u64 {
 
 fn exit_boot_services(image: Handle, mut st: SystemTable<Boot>) -> (SystemTable<Runtime>, &'static mut [MemoryDescriptor]) {
     // allocating the memory map may create new memory regions, thus padding is required
-    let est_mmap_size = st.boot_services().memory_map_size() + 4 * mem::size_of::<MemoryDescriptor>();
+    let est_mmap_size = st.boot_services().memory_map_size().map_size + 4 * mem::size_of::<MemoryDescriptor>();
     let mmap_base = alloc_payload_data(&mut st, est_mmap_size);
     let mut mmap_buf = unsafe { slice::from_raw_parts_mut(mmap_base as *mut u8, est_mmap_size) };
     
@@ -158,10 +158,11 @@ fn read_kernel(image: &Handle, st: &mut SystemTable<Boot>) -> &'static mut [u8] 
     // todo: partition seeking
 
     // get EFI_SIMPLE_FILE_SYSTEM_PROTOCOL, then root directory of the volume, then the EFI_FILE_PROTOCOL handle
-    let ucfs = st.boot_services().get_image_file_system(*image).expect_success("failed to retrieve EFI filesystem");
-    let mut fs = unsafe { &mut *ucfs.get() }.open_volume().expect_success("failed to get root of EFI filesystem.");
+    let sfs = st.boot_services().get_image_file_system(*image).expect_success("failed to retrieve EFI filesystem");
+    let mut fs = unsafe { sfs.interface.get().as_mut().unwrap() }.open_volume().expect_success("failed to get root of EFI filesystem.");
     let fh = fs.open("tauos\\kernel\\kernel", FileMode::Read, 
-        FileAttribute::READ_ONLY | FileAttribute::HIDDEN | FileAttribute::SYSTEM).expect_success("failed to get FileHandle");
+    FileAttribute::READ_ONLY | FileAttribute::HIDDEN | FileAttribute::SYSTEM).expect_success("failed to get FileHandle");
+    drop(sfs);
     
     if let FileType::Regular(mut file) = fh.into_type().expect_success("failed to confirm type of FileHandle") {
         // get file size

@@ -6,7 +6,6 @@
 //! redundant, less thoroughly documented, and untested code.
 
 #![no_std]
-#![feature(asm)]
 #![feature(abi_x86_interrupt)]
 
 pub mod registers;
@@ -48,13 +47,13 @@ impl PriviledgeLevel {
 
 pub fn hlt() {
     unsafe {
-        asm!("hlt", options(nostack, nomem, preserves_flags)); 
+        core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); 
     }
 }
 pub fn hlt_loop() -> ! {
     loop {
         unsafe {
-            asm!("hlt", options(nostack, nomem, preserves_flags)); 
+            core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); 
         }
     }
 }

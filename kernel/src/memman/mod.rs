@@ -1,6 +1,7 @@
 //! Module for memory management-related code of the OS.
 
 pub mod talloc;
+pub mod mapper;
 
 use amd64::paging::{self, PTE};
 use core::slice;
