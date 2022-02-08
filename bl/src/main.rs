@@ -2,7 +2,6 @@
 
 #![no_std]
 #![no_main]
-#![feature(asm)]
 #![feature(abi_efiapi)]
 
 extern crate alloc;

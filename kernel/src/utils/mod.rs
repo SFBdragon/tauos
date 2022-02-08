@@ -5,10 +5,9 @@ pub mod pinning;
 
 /// Copy bits from `src` `src_base..src_acme` into `dst` `dst_base..dst_acme`,
 /// where the indecies are in bits from the slices' respective bases.
-pub fn copy_bits(dst: &mut [u64], src: &[u64], dst_base: usize, dst_acme: usize, src_base: usize, src_acme: usize) {
-    debug_assert_eq!(dst_acme - dst_base, src_acme - src_base);
-    debug_assert!((src_base | src_acme) >> 6 < src.len());
-    debug_assert!((dst_base | dst_acme - 1) >> 6 < dst.len());
+pub fn copy_slice_bits(dst: &mut [u64], src: &[u64], dst_bit_index: usize, src_bit_index: usize, bit_len: usize) {
+    debug_assert!((src_bit_index | (src_bit_index + bit_len)) >> 6 < src.len());
+    debug_assert!((dst_bit_index | (dst_bit_index + bit_len) - 1) >> 6 < dst.len());
     
     /*  Strategy, justification, and edge cases:
 
@@ -34,17 +33,19 @@ pub fn copy_bits(dst: &mut [u64], src: &[u64], dst_base: usize, dst_acme: usize,
         BACK 2349/2348                           FRONT
     */
 
-    let src_index_base = src_base >> 6;
-    let src_index_acme = src_acme - 1 >> 6;
-    let dst_index_base = dst_base >> 6;
-    let dst_index_acme = dst_acme - 1 >> 6;
+    let dst_bit_index_acme = dst_bit_index + bit_len;
+
+    let src_index_base = src_bit_index >> 6;
+    let src_index_acme = (src_bit_index + bit_len) - 1 >> 6;
+    let dst_index_base = dst_bit_index >> 6;
+    let dst_index_acme = dst_bit_index_acme - 1 >> 6;
 
     // preserve destination bits that shouldn't be overwritten
-    let dst_first_ext = dst[dst_index_base] & (1 << (dst_base & 63)) - 1;
-    let dst_last_ext  = dst[dst_index_acme] & !(u64::MAX >> (dst_acme & 63 ^ 63));
+    let dst_first_ext = dst[dst_index_base] & (1 << (dst_bit_index & 63)) - 1;
+    let dst_last_ext  = dst[dst_index_acme] & !(u64::MAX >> (dst_bit_index_acme & 63 ^ 63));
 
     
-    let (diff_base, diff_wraps) = (dst_base & 63).overflowing_sub(src_base & 63);
+    let (diff_base, diff_wraps) = (dst_bit_index & 63).overflowing_sub(src_bit_index & 63);
     // if diff wraps, `& 63` will get `64 - |dst align - src align|`, effectively turning ROL into ROR
     let bit_align_offset = (diff_base & 63) as u32;
     let bit_carry_mask = (1u64 << bit_align_offset) - 1;
@@ -81,6 +82,6 @@ pub fn copy_bits(dst: &mut [u64], src: &[u64], dst_base: usize, dst_acme: usize,
     }
 
     // clear and restore adjacent, overwritten bits
-    dst[dst_index_base] = dst[dst_index_base] & u64::MAX << (dst_base & 63)      ^ dst_first_ext;
-    dst[dst_index_acme] = dst[dst_index_acme] & u64::MAX >> (dst_acme & 63 ^ 63) ^ dst_last_ext;
+    dst[dst_index_base] = dst[dst_index_base] & u64::MAX << (dst_bit_index & 63)           ^ dst_first_ext;
+    dst[dst_index_acme] = dst[dst_index_acme] & u64::MAX >> (dst_bit_index_acme & 63 ^ 63) ^ dst_last_ext;
 }

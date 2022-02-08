@@ -34,6 +34,8 @@ pub struct LlistNode<T> {
     _pin: PhantomPinned,
 }
 
+unsafe impl<T> Send for LlistNode<T> { }
+
 impl<T> Drop for LlistNode<T> {
     fn drop(&mut self) {
         // pin is not moved into or out of
@@ -70,33 +72,31 @@ impl<T> LlistNode<T> {
         Pin::new_unchecked(self.as_ref().prev.get().as_mut())
     }
 
-    /// Get a reference to the next node.
+    /// Get a shared reference to the next node.
     /// # Safety:
     /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
     /// references must not be written to through any other pointer. This is relevant when holding
     /// a reference to a node's `data`, for instance.
     #[inline]
-    pub unsafe fn next(self: Pin<&Self>) -> Pin<&Self> {
-        // SAFETY: LlistNode does not have malicious Deref/DerefMut impls
+    pub unsafe fn next(self: &Self) -> &Self {
         // SAFETY: Caller guarantees that `as_ref`'s aliasing requirements are upheld, API enforces the rest
-        Pin::new_unchecked(self.as_ref().next.get().as_ref())
+        self.next.get().as_ref()
     }
-    /// Get a reference to the previous node.
+    /// Get a shared reference to the previous node.
     /// # Safety:
     /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
     /// references must not be written to through any other pointer. This is relevant when holding
     /// a reference to a node's `data`, for instance.
     #[inline]
-    pub unsafe fn prev(self: Pin<&Self>) -> Pin<&Self> {
-        // SAFETY: LlistNode does not have malicious Deref/DerefMut impls
+    pub unsafe fn prev(self: &Self) -> &Self {
         // SAFETY: Caller guarantees that `as_ref`'s aliasing requirements are upheld, API enforces the rest
-        Pin::new_unchecked(self.as_ref().prev.get().as_ref())
+        self.prev.get().as_ref()
     }
 
     /// Returns whether the previous and next nodes are identical, essentially detecting if the list is
     /// of length 1 (previous and next are self) **or** 2 (previous and next are other) else more.
     #[inline]
-    pub fn is_neighbours_equal(self: Pin<&Self>) -> bool {
+    pub fn is_neighbours_equal(self: &Self) -> bool {
         self.prev.get() == self.next.get()
     }
 
@@ -325,3 +325,4 @@ impl<'llist, T> DoubleEndedIterator for IterMut<'llist, T> {
         }
     }
 }
+
