@@ -3,6 +3,8 @@
 use core::arch::asm;
 
 pub const EFER_MSR: u64 = 0xC0000080;
+pub const MPERF_MSR: u64 = 0xC00000E7;
+pub const APERF_MSR: u64 = 0xC00000E8;
 
 
 bitflags::bitflags! {

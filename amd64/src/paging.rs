@@ -18,7 +18,6 @@ pub const PML4T_LADDR_INDEX_MASK: u64 = 0o000000_777_000_000_000_0000;
 pub const CANONICAL_LOWER_HALF: u64   = 0o000000_377_777_777_777_7777; // 0x0000_7FFF_FFFF_FFFF;
 pub const CANONICAL_HIGHER_HALF: u64  = 0o177777_400_000_000_000_0000;// 0xFFFF_8000_0000_0000;
 
-
 /// Extract and align the index of a Page Table for a given linear address.
 #[inline]
 pub const fn pt_index(laddr: u64) -> usize {

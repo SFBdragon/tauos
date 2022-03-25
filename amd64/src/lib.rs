@@ -13,6 +13,7 @@ pub mod interrupts;
 pub mod segmentation;
 pub mod paging;
 pub mod ports;
+pub mod cpuid;
 
 
 

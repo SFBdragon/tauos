@@ -2,10 +2,12 @@ OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 
 SECTIONS {
-    /* Higher half kernel using code-model 'kernel' (see Sys V ABI)
-     * Lower bound address: 0xffffffff80000000 or 0o177777_777_776_000_000_0000
-     * Upper bound address: 0xffffffffff000000 or 0o177777_777_777_770_000_0000
+    /* 
+     *  Higher half kernel using code-model 'kernel' (see Sys V ABI)
+     *  Lower bound address: 0xffffffff80000000 or 0o177777_777_776_000_000_0000
+     *  Upper bound address: 0xffffffffff000000 or 0o177777_777_777_770_000_0000
      */
+
     . = 0xffffffff80000000;
     . += 0x10000;
 
