@@ -49,7 +49,7 @@ enum BufferPixelFormat {
     Bitmask,
 }
 
-impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
+/* impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
     fn from(format: uefi::proto::console::gop::PixelFormat) -> Self {
         match format {
             uefi::proto::console::gop::PixelFormat::Bgr => BufferPixelFormat::Bgra,
@@ -58,7 +58,7 @@ impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
             uefi::proto::console::gop::PixelFormat::BltOnly => panic!("Cannot use BltOnly pixel format!"),
         }
     }
-}
+} */
 
 
 /* #[derive(Debug)]

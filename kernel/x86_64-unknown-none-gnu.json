@@ -13,7 +13,7 @@
     "linker-flavor": "ld.lld",
     "pre-link-args": { 
         "ld.lld": [ 
-            "--script=D:\\src\\rust\\tauos\\kernel\\kernel.ld" 
+            "--script=./kernel/kernel.ld" 
         ] 
     },
 

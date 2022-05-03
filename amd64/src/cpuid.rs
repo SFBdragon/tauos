@@ -1,11 +1,7 @@
-
 use core::{num::{NonZeroU8, NonZeroU32}, fmt::Debug};
 
 
-
-pub static CPUID: spin::Lazy<CpuId> = spin::Lazy::new(|| {
-    CpuId::read()
-});
+pub static CPUID: spin::Lazy<CpuId> = spin::Lazy::new(|| CpuId::read());
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CpuId {
@@ -441,15 +437,30 @@ impl StructExtFeatInfo {
 /// Extended Topology Enumeration. Return data of CPUID function B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopologyInfo {
+    // Thread level topology, subfunction 0.
+    pub thread_level: Option<ThreadTopologyInfo>,
+    // Core level topology, subfunction 1.
+    pub core_level: Option<CoreTopologyInfo>,
+}
+/// Thread Level Topology Information. Return data of CPUID function B, subfunction 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadTopologyInfo {
     /// 32-bit Extended APIC_ID.
     pub x2_apic_id: u32,
+
     /// Number of bits to shift x2APIC_ID right to get to the topology ID of the next level.
     pub thread_mask_width: u8,
-    /// Number of bits to shift x2APIC_ID right to get to the topology ID of the next level.
-    pub core_mask_width: u8,
-
     /// Number of threads in a core.
     pub threads_per_core: u16,
+}
+/// Core Level Topology Information. Return data of CPUID function B, subfunction 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreTopologyInfo {
+    /// 32-bit Extended APIC_ID.
+    pub x2_apic_id: u32,
+
+    /// Number of bits to shift x2APIC_ID right to get to the topology ID of the next level.
+    pub core_mask_width: u8,
     /// Number of logical cores in socket.
     pub logical_core_count: u16,
 }
@@ -458,26 +469,30 @@ impl TopologyInfo {
     /// ## Safety:
     /// The largest supported standard CPUID function must be `>= 0xB`.
     pub fn read() -> Option<Self> {
-        // todo fix
-
-        // Safety: caller guaranteed
+        // Safety: caller guaranteed, unsupported subfunctions yield zeroes
         let (eax_0, ebx_0, ecx_0, edx_0) = cpuid(0xB, 0)?;
         let (eax_1, ebx_1, ecx_1, edx_1) = cpuid(0xB, 1)?;
 
-        // Ensure x2APID_IDs are equal?
-        assert_eq!(edx_0, edx_1);
-        // Ensure echoed values and level ids are correct:
-        // assert_eq!(ecx_0 & 0xff, 0 << 0 | 1 << 8); // todo fix?
-        // assert_eq!(ecx_1 & 0xff, 0 << 1 | 2 << 8);
-
         Some(
             Self {
-                x2_apic_id: edx_0,
-                thread_mask_width: eax_0 as u8,
-                core_mask_width: eax_1 as u8,
-    
-                threads_per_core: ebx_0 as u16,
-                logical_core_count: ebx_1 as u16,
+                thread_level: if ecx_0 & 0xff == 0 | 1 << 8 {
+                    Some(ThreadTopologyInfo {
+                        x2_apic_id: edx_0,
+                        thread_mask_width: eax_0 as u8,
+                        threads_per_core: ebx_0 as u16,
+                    })
+                } else {
+                    None
+                },
+                core_level: if ecx_1 & 0xff == 1 | 2 << 8 {
+                    Some(CoreTopologyInfo {
+                        x2_apic_id: edx_1,
+                        core_mask_width: eax_1 as u8,
+                        logical_core_count: ebx_1 as u16,
+                    })
+                } else {
+                    None
+                }
             }
         )
     }
@@ -491,7 +506,9 @@ pub struct ExtStateInfo {
 impl ExtStateInfo {
     /// Performs CPUID function 0xD, if supported, and returns the rendered data.
     pub fn read() -> Option<Self> {
-        None
+        return None;
+
+        todo!();
     }
 }
 
@@ -1339,6 +1356,10 @@ pub struct LwpCapabilities {
 impl LwpCapabilities {
     /// Performs CPUID function 0x8000_001C, if supported, and returns the rendered data.
     pub fn read() -> Option<Self> {
+        return None;
+
+        todo!();
+
         if !ExtFeatureInfo::test_ecx_flags(ExtFn1ECX::LWP) {
             return None;
         }

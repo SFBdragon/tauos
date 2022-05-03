@@ -1,6 +1,5 @@
 
 pub mod llist;
-pub mod pinning;
 
 
 /// Copy bits from `src` `src_base..src_acme` into `dst` `dst_base..dst_acme`,

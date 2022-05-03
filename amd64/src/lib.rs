@@ -21,7 +21,7 @@ pub mod cpuid;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PriviledgeLevel {
+pub enum PrivLvl {
     /// Operating System
     Ring0 = 0b00,
     Ring1 = 0b01,
@@ -30,15 +30,25 @@ pub enum PriviledgeLevel {
     Ring3 = 0b11,
 }
 
-impl PriviledgeLevel {
-    fn from_bits(from: u8) -> Self {
+impl PrivLvl {
+    #[inline]
+    pub fn from_bits(from: u8) -> Self {
         match from {
-            0b00 => PriviledgeLevel::Ring0,
-            0b01 => PriviledgeLevel::Ring1,
-            0b10 => PriviledgeLevel::Ring2,
-            0b11 => PriviledgeLevel::Ring3,
+            0b00 => PrivLvl::Ring0,
+            0b01 => PrivLvl::Ring1,
+            0b10 => PrivLvl::Ring2,
+            0b11 => PrivLvl::Ring3,
             _ => panic!("Invalid x86 priviledge level: {}", from),
         }
+    }
+
+    #[inline]
+    pub fn to_bits(self) -> u8 {
+        self as u8
+    }
+
+    pub fn is_userland(self) -> bool {
+        matches!(self, PrivLvl::Ring3)
     }
 }
 

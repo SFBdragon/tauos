@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, fmt::Debug, panic, mem::{MaybeUninit, size_of}};
 
-use super::{segmentation::{DescriptorTableOp, SegmentSelector}, PriviledgeLevel};
+use super::{segmentation::{DescriptorTableOp, SegmentSelector}, PrivLvl};
 
 
 // ERROR CODES
@@ -167,7 +167,7 @@ impl<F> IntTrapGate<F> {
     /// # Arguments
     /// * `ssdt`: `ssdt` must be either `Ssdt::InterruptGate` or `Ssdt::TrapGate`.
     /// * `ist`: `ist` (Interrupt Stack Table index) must be less than 8.
-    pub fn new(target_laddr: u64, selector: SegmentSelector, ist: u8, ssdt: Ssdt, priviledge: PriviledgeLevel) -> Self {
+    pub fn new(target_laddr: u64, selector: SegmentSelector, ist: u8, ssdt: Ssdt, priviledge: PrivLvl) -> Self {
         match ssdt {
             Ssdt::InterruptGate => (),
             Ssdt::TrapGate => (),
@@ -231,11 +231,11 @@ impl<F> IntTrapGate<F> {
     } 
 
     #[inline]
-    pub fn get_dpl(&self) -> PriviledgeLevel {
-        PriviledgeLevel::from_bits((self.flags & GATE_DPL_MASK) >> GATE_DPL_MASK.trailing_zeros())
+    pub fn get_dpl(&self) -> PrivLvl {
+        PrivLvl::from_bits((self.flags & GATE_DPL_MASK) >> GATE_DPL_MASK.trailing_zeros())
     }
     #[inline]
-    pub fn set_dpl(&mut self, dpl: PriviledgeLevel) {
+    pub fn set_dpl(&mut self, dpl: PrivLvl) {
         self.flags = self.flags & !GATE_DPL_MASK | dpl as u8;
     }
 
@@ -315,7 +315,7 @@ impl<F> CallGate<F> {
         }
     }
 
-    pub fn new(target_laddr: u64, selector: SegmentSelector, priviledge: PriviledgeLevel) -> Self {
+    pub fn new(target_laddr: u64, selector: SegmentSelector, priviledge: PrivLvl) -> Self {
         CallGate {
             isr_ptr_lo: target_laddr as u16,
             selector: selector.0,
@@ -340,11 +340,11 @@ impl<F> CallGate<F> {
     } 
 
     #[inline]
-    pub fn get_dpl(&self) -> PriviledgeLevel {
-        PriviledgeLevel::from_bits((self.flags & GATE_DPL_MASK) >> GATE_DPL_MASK.trailing_zeros())
+    pub fn get_dpl(&self) -> PrivLvl {
+        PrivLvl::from_bits((self.flags & GATE_DPL_MASK) >> GATE_DPL_MASK.trailing_zeros())
     }
     #[inline]
-    pub fn set_dpl(&mut self, dpl: PriviledgeLevel) {
+    pub fn set_dpl(&mut self, dpl: PrivLvl) {
         self.flags = self.flags & !GATE_DPL_MASK | dpl as u8;
     }
 

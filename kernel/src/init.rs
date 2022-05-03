@@ -1,65 +1,53 @@
 #![no_std]
 #![no_main]
+
 #![feature(ptr_metadata)]
 #![feature(alloc_error_handler)]
+
+mod bootboot;
 
 use core::{panic::PanicInfo, slice};
  
 use amd64::{self, paging::{self, PTE}, registers::{CR3, CR0}, segmentation::{CodeSegmentDescriptor, self, SegmentSelector}};
-use libkernel::{BootPayload, memman, println, out};
-use uefi::table::boot::MemoryType;
+use libkernel::{println, out};
+use bootboot::*;
 
-
-static mut PAYLOAD: Option<BootPayload> = None;
 
 #[no_mangle]
-#[allow(improper_ctypes_definitions)] // doesn't get called by C code
-pub extern "sysv64" fn _start(payload: BootPayload) -> ! {
-    println!("KERNEL START");
-    
-    unsafe {
-        // store the payload in a static variable
-        // this circumvents the difficulty of accessing old stack data after the stack switch
-        PAYLOAD = Some(payload);
+pub extern "C" fn _start() -> ! {
+    /// BOOTBOOT-setup framebuffer pointer
+    const FRAMEBUFFER: *const u8 = 0xfffffffffc000000 as *const _;
+    /// BOOTBOOT-setup environment string pointer
+    const ENV_CFG: *const u8 = 0xffffffffffe01000 as *const _;
+    /// BOOTBOOT payload data pointer
+    const BOOTBOOT: *const bootboot::BootBoot = 0xffffffffffe00000 as *const _;
+    /// BOOTBOOT memory map
+    const MMAP: *const bootboot::MMapEnt = BOOTBOOT.wrapping_offset(1) as *const _;
 
-        // switch the stacks onto loader pre-allocated stack area
-        // mem::KERNEL_STACK_BOTTOM itself is unmapped, thus reduce by sixteen (preserves alignment)
-        core::arch::asm!("mov rsp, {}", in(reg) memman::KERNEL_STACK_BOTTOM - 0x10, options(preserves_flags));
-    };
 
-    // jump to init immediately; don't touch the stack
-    init();
-}
-
-fn init() -> ! {
-    // retrieve the payload
-    let payload = unsafe { core::mem::replace(&mut PAYLOAD, None).unwrap() };
-
-    println!("KERNEL INIT");
-    println!("UART Chip Version: {:?}", out::uart::UART_COM1.1);
-
-    println!("{}", payload.mmap.iter().fold(0, |s, x| s + x.page_count));
-    
-
-    // parse out tables
-    //let mut rsdp: *const c_void;
-    for table in payload.st.config_table() {
-        match table.guid {
-            uefi::table::cfg::ACPI2_GUID => { /* rsdp = table.address; */ },
-            uefi::table::cfg::ACPI_GUID => { },
-            uefi::table::cfg::PROPERTIES_TABLE_GUID => { /* not useful */ },
-            _ => (),
-        }
+    if unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u16 != (*BOOTBOOT).bspid } {
+        amd64::hlt_loop();
     }
-
     
-    let payload = unsafe { paging_setup(payload) };
+    println!("KERNEL INIT");
+
+
+    amd64::hlt_loop();
     
-    unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
 
-    unsafe { alloc_setup(&payload); } // todo
+    // extract data from bb structs
+    // set up paging
+    // stack switch(es)
 
-    println!("here8");
+
+    //// SAFETY: init is never called twice, hence nor is paging_setup
+    //unsafe { paging_setup(&mut payload) };
+    //
+    //unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
+//
+    //unsafe { alloc_setup(&payload); } // todo
+//
+    //println!("here8");
     amd64::hlt_loop();
 
 
@@ -98,7 +86,10 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 
 /// # Safety:
 /// Do not call twice. Assumes UEFI- & OS loader-defined handoff state.
-pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayload {
+pub unsafe fn paging_setup() {
+    use libkernel::memm;
+
+    todo!();
 
     /*                                     SET UP PAGING
     Goals:
@@ -125,7 +116,7 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
     All pages are located within LOADER_DATA and BOOT_SERVICES_DATA memory regions as speficied by the UEFI map.
     */
 
-    #[inline]
+    /* #[inline]
     fn pt_from_getter<F: FnMut() -> u64>(get_page: &mut F) -> &'static mut [PTE] {
         unsafe {
             let table = core::slice::from_raw_parts_mut(get_page() as *mut PTE, 512);
@@ -141,7 +132,7 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
 
     // find a large hole in physical memory free for use (there's generally at least one massive one)
     let largest = payload.mmap.iter_mut()
-        .filter(|desc| desc.ty == MemoryType::CONVENTIONAL)
+        //.filter(|desc| desc.ty == MemoryType::CONVENTIONAL)
         .max_by(|x, y| x.phys_start.cmp(&y.phys_start))
         .expect("failed to find a free memory region");
     // create an iterator over the pages therein
@@ -159,11 +150,11 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
     cr3.set_paddr(pml4t.as_ptr() as u64);
 
     // install recursive entry
-    pml4t[memman::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pml4t.as_ptr() as u64);
+    pml4t[memm::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pml4t.as_ptr() as u64);
 
     // map physical memory
     let pmap_pdpt = pt_from_getter(&mut get_page);
-    pml4t[paging::pml4t_index(memman::PHYS_LADDR_OFFSET)] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pmap_pdpt.as_ptr() as u64);
+    pml4t[paging::pml4t_index(memm::PHYS_LADDR_OFFSET)] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(pmap_pdpt.as_ptr() as u64);
 
     for phys_gibi in 0..((total_phys_size + paging::PDPE_MAPPED_SIZE - 1) / paging::PDPE_MAPPED_SIZE) { // round up
         pmap_pdpt[phys_gibi as usize] = PTE::PRESENT | PTE::WRITE | PTE::HUGE_PAGE | PTE::from_paddr(phys_gibi * paging::PDPE_MAPPED_SIZE);
@@ -171,7 +162,7 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
 
     // map the UEFI GOP frame buffer into fixed-offset space too
     // it is identity mapped outside of physical address space - per testing
-    pmap_pdpt[paging::pdpt_index(payload.frame_buffer_ptr as u64 + memman::PHYS_LADDR_OFFSET)] = 
+    pmap_pdpt[paging::pdpt_index(payload.frame_buffer_ptr as u64 + memm::PHYS_LADDR_OFFSET)] = 
         PTE::PRESENT | PTE::WRITE | PTE::HUGE_PAGE | PTE::from_paddr(payload.frame_buffer_ptr as u64);
     // check if a second page is needed (shouldn't be the case, the framebuffer is usually - per testing - gibibyte-aligned)
     let fb_size = payload.frame_buffer_info.stride() * payload.frame_buffer_info.resolution().1 * out::framebuffer::PIXEL_WIDTH;
@@ -186,10 +177,10 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
     // install a recursive entry into the existing UEFI-setup pml4t
     {
         let uefi_cr3 = CR3::read();
-        let uefi_pml4t = unsafe { slice::from_raw_parts_mut(uefi_cr3.get_paddr() as *mut PTE, 512) };
-        unsafe { CR0::write(&(CR0::read() & !CR0::WP)); } // UEFI page tables tend to be write-protected
-        uefi_pml4t[memman::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(uefi_cr3.get_paddr());
-        unsafe { CR0::write(&(CR0::read() | CR0::WP)); } // reset to prevent silent bugs
+        let uefi_pml4t = slice::from_raw_parts_mut(uefi_cr3.get_paddr() as *mut PTE, 512);
+        CR0::write(&(CR0::read() & !CR0::WP)); // UEFI page tables tend to be write-protected
+        uefi_pml4t[memm::RECURSIVE_INDEX as usize] = PTE::PRESENT | PTE::WRITE | PTE::from_paddr(uefi_cr3.get_paddr());
+        CR0::write(&(CR0::read() | CR0::WP)); // reset to prevent silent bugs
     }
 
     // hunt down the locations of the physical memory of the load segments
@@ -203,7 +194,9 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
     for phdr in phdr_iter {
         // get physical address of the program segment
 
-        let phys_base = unsafe { *(paging::recur_to_pte(phdr.vaddr(), memman::RECURSIVE_INDEX) as *mut PTE) }.get_paddr();
+        let phys_base = unsafe {
+            *(paging::recur_to_pte(phdr.vaddr(), memm::RECURSIVE_INDEX) as *mut PTE)
+        }.get_paddr();
 
         // remap the program segment
 
@@ -217,27 +210,25 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
             leaf_entry |= PTE::WRITE;
         } 
 
-        unsafe {
-            libkernel::memman::map_pages_when_ident(
-                &mut phdr.vaddr().clone(),
-                &mut phys_base.clone(),
-                &mut page_count.clone(), 
-                PTE::PRESENT | PTE::WRITE, 
-                leaf_entry, 
-                4,
-                pml4t,
-                &mut get_page,
-            );
-        }
+        libkernel::memm::map_pages_when_ident(
+            &mut phdr.vaddr().clone(),
+            &mut phys_base.clone(),
+            &mut page_count.clone(), 
+            PTE::PRESENT | PTE::WRITE, 
+            leaf_entry, 
+            4,
+            pml4t,
+            &mut get_page,
+        );
     }
 
     // remap the stack
     unsafe {
-        let stack_virt_base = memman::KERNEL_STACK_BOTTOM - memman::KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE;
-        libkernel::memman::map_pages_when_ident(
+        let stack_virt_base = memm::KERNEL_STACK_BOTTOM - memm::KERNEL_STACK_PAGE_COUNT * paging::PTE_MAPPED_SIZE;
+        libkernel::memm::map_pages_when_ident(
             &mut stack_virt_base.clone(),
-            &mut (*(paging::recur_to_pte(stack_virt_base, memman::RECURSIVE_INDEX) as *const PTE)).get_paddr(),
-            &mut memman::KERNEL_STACK_PAGE_COUNT.clone(), 
+            &mut (*(paging::recur_to_pte(stack_virt_base, memm::RECURSIVE_INDEX) as *const PTE)).get_paddr(),
+            &mut memm::KERNEL_STACK_PAGE_COUNT.clone(), 
             PTE::PRESENT | PTE::WRITE, 
             PTE::PRESENT | PTE::WRITE | PTE::NO_EXECUTE, 
             4,
@@ -254,29 +245,22 @@ pub unsafe fn paging_setup(mut payload: crate::BootPayload) -> crate::BootPayloa
 
     
     // load in the new CR3, which automatically invalidates TLB pages
-    unsafe { CR3::write(cr3); }
+    CR3::write(cr3);
 
 
     // fix up references
 
-    payload.mmap = unsafe {
-        slice::from_raw_parts_mut(
-            payload.mmap.as_mut_ptr().cast::<u8>().wrapping_add(memman::PHYS_LADDR_OFFSET as usize).cast(), 
-            core::ptr::metadata(payload.mmap))
-    };
-    payload.bin = unsafe {
-        slice::from_raw_parts(
-            payload.bin.as_ptr().wrapping_add(memman::PHYS_LADDR_OFFSET as usize), 
-            core::ptr::metadata(payload.bin))
-    };
-    payload.frame_buffer_ptr = payload.frame_buffer_ptr.wrapping_add(memman::PHYS_LADDR_OFFSET as usize);
+    payload.mmap = slice::from_raw_parts_mut(
+            payload.mmap.as_mut_ptr().cast::<u8>().wrapping_add(memm::PHYS_LADDR_OFFSET as usize).cast(), 
+            core::ptr::metadata(payload.mmap));
+    payload.bin = slice::from_raw_parts(
+            payload.bin.as_ptr().wrapping_add(memm::PHYS_LADDR_OFFSET as usize), 
+            core::ptr::metadata(payload.bin));
+    payload.frame_buffer_ptr = payload.frame_buffer_ptr.wrapping_add(memm::PHYS_LADDR_OFFSET as usize);
 
     
     // fix up UEFI system table references and runtime mappings
-    payload.mmap.iter_mut().for_each(|desc| desc.virt_start = desc.phys_start + memman::PHYS_LADDR_OFFSET);
-
-    
-    payload
+    payload.mmap.iter_mut().for_each(|desc| desc.virt_start = desc.phys_start + memm::PHYS_LADDR_OFFSET); */
 }
 
 /* 
@@ -289,7 +273,7 @@ static mut ALLOCATOR: memman::talloc::Talloc = unsafe {
 
 static mut MAPPER: map = unsafe { map }; */
 
-/// # Safety:
+/* /// # Safety:
 /// Do not call twice. Assumes allocators have yet to be initialized.
 pub unsafe fn alloc_setup(_payload: &BootPayload) {
     // todo!
@@ -344,7 +328,7 @@ pub fn segmentation_setup() {
         segmentation::lgdt(uefi_gdt);
 
         // reset CS register so that the new GDT entry is used
-        segmentation::cs_write(SegmentSelector::new_gdt(amd64::PriviledgeLevel::Ring0, 1));
+        segmentation::cs_write(SegmentSelector::new_gdt(amd64::PrivLvl::Ring0, 1));
     }
-}
+} */
 

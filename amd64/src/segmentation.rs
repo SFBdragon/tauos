@@ -2,7 +2,7 @@
 
 use core::{arch::asm, mem::{size_of, MaybeUninit}};
 
-use super::{PriviledgeLevel, interrupts::Ssdt};
+use super::{PrivLvl, interrupts::Ssdt};
 
 
 
@@ -24,16 +24,16 @@ impl SegmentSelector {
     /// Descriptor Table index mask
     pub const INDEX_MASK: u16 = 0b11111111_11111000;
 
-    pub fn new_gdt(rpl: PriviledgeLevel, index: u16) -> Self {
+    pub fn new_gdt(rpl: PrivLvl, index: u16) -> Self {
         SegmentSelector((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros()) 
     }
-    pub fn new_ldt(rpl: PriviledgeLevel, index: u16) -> Self {
+    pub fn new_ldt(rpl: PrivLvl, index: u16) -> Self {
         SegmentSelector((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros() | Self::TABLE_SELECTOR_BIT) 
     }
 
     #[inline]
-    pub fn get_rpl(&self) -> PriviledgeLevel {
-        PriviledgeLevel::from_bits((self.0 & Self::RPL_MASK) as u8)
+    pub fn get_rpl(&self) -> PrivLvl {
+        PrivLvl::from_bits((self.0 & Self::RPL_MASK) as u8)
     }
     #[inline]
     pub fn set_rpl(&mut self, rpl: u8) {
@@ -237,7 +237,7 @@ impl SystemSegmentDescriptor {
     const GRANULARITY: u8 = 0b1000_0000;
     const LIMIT_MASK: u8 = 0b0000_1111;
 
-    pub fn new(base_laddr: u64, limit: u32, ssdt: Ssdt, priviledge: PriviledgeLevel, page_granularity_limit: bool) -> Self {
+    pub fn new(base_laddr: u64, limit: u32, ssdt: Ssdt, priviledge: PrivLvl, page_granularity_limit: bool) -> Self {
         SystemSegmentDescriptor {
             limit_lo: limit as u16,
             base_lo: base_laddr as u16,
@@ -297,11 +297,11 @@ impl SystemSegmentDescriptor {
     } 
 
     #[inline]
-    pub fn get_dpl(&self) -> PriviledgeLevel {
-        PriviledgeLevel::from_bits((self.flags & Self::DPL_MASK) >> Self::DPL_MASK.trailing_zeros())
+    pub fn get_dpl(&self) -> PrivLvl {
+        PrivLvl::from_bits((self.flags & Self::DPL_MASK) >> Self::DPL_MASK.trailing_zeros())
     }
     #[inline]
-    pub fn set_dpl(&mut self, dpl: PriviledgeLevel) {
+    pub fn set_dpl(&mut self, dpl: PrivLvl) {
         self.flags = self.flags & !Self::DPL_MASK | dpl as u8;
     }
 

@@ -152,8 +152,20 @@ bitflags::bitflags! {
     }
 }
 
+#[macro_export]
+macro_rules! disable_wp {
+    { $b:block } => {
+        let cr0 = amd64::registers::CR0::read();
+        (cr0 & !amd64::registers::CR0::WP).write();
+
+        { $b }
+
+        cr0.write();
+    };
+}
+
 impl RFLAGS {
-    pub fn from_iopl(pl: crate::PriviledgeLevel) -> Self {
+    pub fn from_iopl(pl: crate::PrivLvl) -> Self {
         unsafe {
             Self::from_bits_unchecked((pl as u64) << RFLAGS::IOPL_MASK.bits.trailing_zeros())
         }
@@ -175,8 +187,8 @@ impl RFLAGS {
     }
 
     
-    pub fn get_iopl(&self) -> crate::PriviledgeLevel {
-        crate::PriviledgeLevel::from_bits(
+    pub fn get_iopl(&self) -> crate::PrivLvl {
+        crate::PrivLvl::from_bits(
             ((self.bits & RFLAGS::IOPL_MASK.bits) >> RFLAGS::IOPL_MASK.bits.trailing_zeros()) as u8)
     }
 }
@@ -378,7 +390,6 @@ impl CR3 {
         }
     }
 }
-
 
 
 

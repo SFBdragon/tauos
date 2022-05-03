@@ -1,6 +1,9 @@
 [workspace]
 members = [
-    "bl",
     "kernel",
     "amd64",
 ]
+
+[profile.dev]
+opt-level = 1 # decrease binary size and speed up execution
+debug = 0 # decrease binary size

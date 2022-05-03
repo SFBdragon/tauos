@@ -1,4 +1,4 @@
-use core::{mem::MaybeUninit, ptr::NonNull, cell::Cell, marker::{PhantomData, PhantomPinned}, pin::Pin};
+use core::{ptr::NonNull, cell::Cell};
 
 
 /// Describes a linked list node.
@@ -9,12 +9,12 @@ use core::{mem::MaybeUninit, ptr::NonNull, cell::Cell, marker::{PhantomData, Pha
 ///  * **uses the concept of a 'head' node** which is homogenous, but isn't iterated over
 ///  * **implicitly non-zero in length** by virtue of the lack of a heterogenous component
 ///  * **doubly linked** to allow bidirectional traversal and single ref removal
-///  * **fairly unsafe** due to inter-referenciality and self-referenciality
+///  * **very unsafe** due to pointer usage, inter-referenciality, and self-referenciality
 /// 
-/// # Safety:
-/// `LlistNode<T>`s are inherently unsafe due to the referencial dependency between nodes,
+/// ### Safety:
+/// `LlistNode`s are inherently unsafe due to the referencial dependency between nodes,
 /// as well as the self-referencial configuration with linked lists of length 1. This requires
-/// that `LlistNode<T>`s are never moved manually, otherwise using the list becomes memory
+/// that `LlistNode`s are never moved manually, otherwise using the list becomes memory
 /// unsafe and may lead to undefined behaviour.
 /// 
 /// Generally speaking, traversal while holding references to multiple nodes is also potentially
@@ -29,110 +29,28 @@ use core::{mem::MaybeUninit, ptr::NonNull, cell::Cell, marker::{PhantomData, Pha
 #[derive(Debug)]
 pub struct LlistNode<T> {
     pub data: T,
-    next: Cell<NonNull<LlistNode<T>>>,
-    prev: Cell<NonNull<LlistNode<T>>>,
-    _pin: PhantomPinned,
-}
-
-unsafe impl<T> Send for LlistNode<T> { }
-
-impl<T> Drop for LlistNode<T> {
-    fn drop(&mut self) {
-        // pin is not moved into or out of
-        let pin = unsafe { Pin::new_unchecked(self) };
-        // `self` may have already been `.remove()`d, however doing so is fine as it is hence semantically a no-op
-        // in such a case it may be a needless expense, in which case nodes should instead be overwitten through pointers
-        // or forgotten. Talloc does not ever drop nodes, it only overwrites them. Nodes should never enter an invalid
-        // state, thus leaving them un-dropped should not decay their states ever, as they are immovable.
-        pin.remove();
-    }
+    pub next: Cell<NonNull<LlistNode<T>>>,
+    pub prev: Cell<NonNull<LlistNode<T>>>,
 }
 
 impl<T> LlistNode<T> {
-    /// Get a mutable reference to the next node.
-    /// # Safety:
-    /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
-    /// references must not be read or written to through any other pointer. This is relevant when holding
-    /// a reference to a node's `data`, for instance.
-    #[inline]
-    pub unsafe fn next_mut(self: Pin<&mut Self>) -> Pin<&mut Self> {
-        // SAFETY: LlistNode does not have malicious Deref/DerefMut impls
-        // SAFETY: Caller guarantees that `as_mut`'s aliasing requirements are upheld, API enforeces the rest
-        Pin::new_unchecked(self.as_ref().next.get().as_mut())
-    }
-    /// Get a mutable reference to the previous node.
-    /// # Safety:
-    /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
-    /// references must not be read or written to through any other pointer. This is relevant when holding
-    /// a reference to a node's `data`, for instance.
-    #[inline]
-    pub unsafe fn prev_mut(self: Pin<&mut Self>) -> Pin<&mut Self> {
-        // SAFETY: LlistNode does not have malicious Deref/DerefMut impls
-        // SAFETY: Caller guarantees that `as_mut`'s aliasing requirements are upheld, API enforeces the rest
-        Pin::new_unchecked(self.as_ref().prev.get().as_mut())
-    }
-
-    /// Get a shared reference to the next node.
-    /// # Safety:
-    /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
-    /// references must not be written to through any other pointer. This is relevant when holding
-    /// a reference to a node's `data`, for instance.
-    #[inline]
-    pub unsafe fn next(self: &Self) -> &Self {
-        // SAFETY: Caller guarantees that `as_ref`'s aliasing requirements are upheld, API enforces the rest
-        self.next.get().as_ref()
-    }
-    /// Get a shared reference to the previous node.
-    /// # Safety:
-    /// You must enfore Rust's aliasing rules for the next node. The memory the resulting reference
-    /// references must not be written to through any other pointer. This is relevant when holding
-    /// a reference to a node's `data`, for instance.
-    #[inline]
-    pub unsafe fn prev(self: &Self) -> &Self {
-        // SAFETY: Caller guarantees that `as_ref`'s aliasing requirements are upheld, API enforces the rest
-        self.prev.get().as_ref()
-    }
-
-    /// Returns whether the previous and next nodes are identical, essentially detecting if the list is
-    /// of length 1 (previous and next are self) **or** 2 (previous and next are other) else more.
-    #[inline]
-    pub fn is_neighbours_equal(self: &Self) -> bool {
-        self.prev.get() == self.next.get()
-    }
-
-
-
     /// Create a new independent node in place.
     /// 
-    /// Warning: This will not call `node`'s drop code, regardless of initialization. 
-    /// It is your responsibility to make sure `node` gets removed/dropped if/as necessary.
-    /// Failing to do so when is not undefined behaviour or memory unsafe, but may cause unexpected behaviour:
-    /// `node` will become a 'sink' node, trapping traversal from its previous linked list. This is often not desirable.
+    /// Warning: This will not call `remove` on `node`, regardless of initialization. 
+    /// It is your responsibility to make sure `node` gets `remove`d if necessary.
+    /// Failing to do so when is not undefined behaviour or memory unsafe, but 
+    /// may cause complex and unexpected linkages.
+    /// 
+    /// ### Safety:
+    /// * `node` must be `ptr::write`-able.
     #[inline]
-    pub const fn new_llist(node: Pin<&'_ mut MaybeUninit<Self>>, data: T) -> Pin<&'_ mut Self> {
-        let node_ref = unsafe {
-            // SAFETY: node is not moved
-            node.get_unchecked_mut()
-        };
-
-        let node_ptr = unsafe { 
-            // SAFETY: node is a valid reference, thus the resulting pointer is valid and dereferencable
-            NonNull::new_unchecked(
-                // SAFETY: node_ptr is not dereferenced before it is initialized
-                node_ref as *mut _ as *mut Self
-            )
-        };
-
-        let initd_node = node_ref.write(Self {
-            data,
-            prev: Cell::new(node_ptr),
-            next: Cell::new(node_ptr),
-            _pin: PhantomPinned,
-        });
-
+    pub fn new_llist(node: NonNull<Self>, data: T) {
         unsafe {
-            // SAFETY: node arg is contractually pinned, thus pinning guarantee is maintained
-            Pin::new_unchecked(initd_node)
+            node.as_ptr().write(Self {
+                data,
+                prev: Cell::new(node),
+                next: Cell::new(node),
+            });
         }
     }
 
@@ -141,187 +59,150 @@ impl<T> LlistNode<T> {
     /// `prev` and `next` may belong to different linked lists,
     /// doing do may however cause complex and unexpected linkages.
     /// 
-    /// Warning: This will not call `node`'s drop code, regardless of initialization. 
-    /// It is your responsibility to make sure `node` gets removed/dropped if/as necessary.
-    /// Failing to do so when is not undefined behaviour or memory unsafe, but may cause unexpected behaviour:
-    /// a figure 8 pattern will form between two circular linked lists. This is often not desirable.
-    pub fn new<'s, 'p, 'n>(node: Pin<&'s mut MaybeUninit<Self>>, prev: &'p Self, next: &'n Self, data: T)
-    -> Pin<&'s mut Self> {
-        // SAFETY: node is not moved
-        let initd_node = unsafe { node.get_unchecked_mut() }.write(Self { 
+    /// Warning: This will not call `remove` on `node`, regardless of initialization. 
+    /// It is your responsibility to make sure `node` gets `remove`d if necessary.
+    /// Failing to do so when is not undefined behaviour or memory unsafe, but 
+    /// may cause complex and unexpected linkages.
+    /// 
+    /// ### Safety:
+    /// * `node` must be `ptr::write`-able.
+    /// * `prev` and `next` must be dereferencable and valid.
+    pub unsafe fn new(node: NonNull<Self>, prev: NonNull<Self>, next: NonNull<Self>, data: T) {
+        node.as_ptr().write(Self { 
             data,
-            prev: Cell::new(prev.into()),
-            next: Cell::new(next.into()),
-            _pin: PhantomPinned,
+            prev: Cell::new(prev),
+            next: Cell::new(next),
         });
 
-        next.prev.set(initd_node.into());
-        prev.next.set(initd_node.into());
+        (*next.as_ptr()).prev.set(node);
+        (*prev.as_ptr()).next.set(node);
+    }
+    
+    /// Move `self` into a new location, leaving `self` as an isolated node.
+    /// ### Safety:
+    /// * `dest` must be `ptr::write`-able.
+    /// * `self` must be dereferencable and valid.
+    pub unsafe fn mov(src: NonNull<Self>, dest: NonNull<Self>) {
+        dest.as_ptr().write(src.as_ptr().read());
 
-        unsafe {
-            // SAFETY: node arg is contractually pinned, thus pinning guarantee is maintained
-            Pin::new_unchecked(initd_node)
-        }
+        (*src.as_ptr()).prev.set(src);
+        (*src.as_ptr()).next.set(src);
     }
 
-    /// Move `self` into a new location, leaving `self` as an isolated linked list with `replacement_data` while
-    /// the result of the function is identical to `self` as of calling but in a different memory location.
-    pub fn mov<'a>(mut self: Pin<&mut Self>, dest: Pin<&'a mut MaybeUninit<Self>>, replacement_data: T) -> Pin<&'a mut Self> {
-        // SAFETY: node is not moved
-        let initd_node = unsafe { dest.get_unchecked_mut() }.write(Self { 
-            // SAFETY: moving data does not invalidate the pinning which is inteded for `prev` and `next`
-            data: core::mem::replace(&mut unsafe { self.as_mut().get_unchecked_mut() }.data, replacement_data),
-            prev: Cell::new(self.prev.get()),
-            next: Cell::new(self.next.get()),
-            _pin: PhantomPinned,
-        });
-        
-        unsafe {
-            // SAFETY: `prev` and `next` are not publicly exposed, and are not set to be non-dereferenceable internally
-            (*self.prev.get().as_ptr()).prev.set(initd_node.into());
-            (*self.next.get().as_ptr()).next.set(initd_node.into());
-        }
+    /// Remove `self` from it's linked list, leaving `self` as an isolated node.
+    /// If `self` is linked only to itself, this is effectively a no-op.
+    /// ### Safety:
+    /// * `self` must be dereferencable and valid.
+    pub unsafe fn remove(node: NonNull<Self>) {
+        let prev = (*node.as_ptr()).prev.get();
+        let next = (*node.as_ptr()).next.get();
+        (*prev.as_ptr()).next.set(next);
+        (*next.as_ptr()).prev.set(prev);
 
-        // SAFETY: self is not moved
-        let self_ptr = unsafe { self.as_mut().get_unchecked_mut().into() };
-        self.prev.set(self_ptr);
-        self.next.set(self_ptr);
-
-        unsafe {
-            Pin::new_unchecked(initd_node)
-        }
-    }
-
-    /// Isolate `node`, removing it from its linked list, and effectively making a new linked list of only `node`.
-    pub fn remove(mut self: Pin<&mut Self>) {
-        // the linked list is circular, which always has an element that isn't removed
-        // thus in the case that this is the last element, this is still safe, and there is no case of zero elements
-
-        unsafe {
-            // SAFETY: `prev` and `next` are not publicly exposed, and are not set to be non-dereferenceable internally
-            (*self.prev.get().as_ptr()).next.set(self.next.get());
-            (*self.next.get().as_ptr()).prev.set(self.prev.get());
-        }
-
-        unsafe {
-            // SAFETY: Deref/DerefMut are not malicious, 
-            // `prev` and `next` are not publicly exposed, and the pointer is neither moved out of or into internally
-            let self_ptr = NonNull::from(self.as_mut().get_unchecked_mut());
-            self.prev.set(self_ptr);
-            self.next.set(self_ptr);
-        }
+        (*node.as_ptr()).prev.set(node);
+        (*node.as_ptr()).next.set(node);
     }
 
 
     /// Removes a chain of nodes from `start` to `end` inclusive from it's current list and inserts the
-    /// chain between `prev` and `next`. Can be used to move a chain within a single list.
+    /// chain between `prev` and `next`. This can also be used to move a chain within a single list.
     /// 
     /// # Arguments
     /// * `start` and `end` can be identical (relink 1 node).
-    /// * `prev` and `next` can be identical (relink around a 'head' - `prev`/`next`).
+    /// * `prev` and `next` can be identical (relink around a 'head').
     /// * All 4 arguments can be identical (orphans a single node as its own linked list).
     /// 
     /// While `start`/`end` and `prev`/`next` should belong to the same lists respectively, this is not required.
-    /// Not doing so may create complex or nonsensical links.
-    pub fn relink(start: &Self, end: &Self, prev: &Self, next: &Self) {
+    /// Not doing so may cause complex and unexpected linkages.
+    /// ### Safety:
+    /// * All arguments must be dereferencable and valid.
+    pub unsafe fn relink(start: NonNull<Self>, end: NonNull<Self>, 
+    prev: NonNull<Self>, next: NonNull<Self>) {
         // link up old list
-        unsafe {
-            // SAFETY: a reference is not created to neighbouring nodes to avoid aliasing refereces
-            // modification occurs through a Cell (UnsafeCell), thus mut refs' rules are not violated
-            (*start.prev.get().as_ptr()).next.set(end.next.get());
-            (*end.next.get().as_ptr()).prev.set(start.prev.get());
-        }
+        let start_prev = (*start.as_ptr()).prev.get();
+        let end_next   = (*end  .as_ptr()).next.get();
+        (*start_prev.as_ptr()).next.set(end_next);
+        (*end_next  .as_ptr()).prev.set(start_prev);
 
         // link up new list
-        start.prev.set(prev.into());
-        end.next.set(next.into());
-        prev.next.set(start.into());
-        next.prev.set(end.into());
+        (*(start.as_ptr())).prev.set(prev);
+        (*(end  .as_ptr())).next.set(next);
+        (*(prev .as_ptr())).next.set(start);
+        (*(next .as_ptr())).prev.set(end);
     }
 
 
-    /// Creates an iterator over the circular linked list using `self` as the sentinel item.
-    /// 
-    /// Note that this iterator is both `DoubleEndedIterator` and allows the modification and
-    /// deletion of the current node without effecting iteration.
-    /// 
-    /// # Safety:
-    /// Caller must guarantee that their are no active references to the linked lists' nodes besides `node`,
-    /// and the references that will be returned from the iterator, until the iterator is dropped.
-    pub unsafe fn iter_mut<'llist>(mut self: Pin<&mut Self>) -> IterMut<'llist, T> {
-        IterMut {
-            // SAFETY: Iter does not move sentinel
-            sentinel: self.as_mut().get_unchecked_mut().into(),
-            next_backward: self.as_ref().prev.get(),
-            next_forward: self.as_ref().next.get(),
-            prior_overlap: false,
-            _phantom: PhantomData,
-        }
+    /// Creates an iterator over the circular linked list, exclusive of
+    /// the sentinel.
+    /// ### Safety:
+    /// `start`'s linked list must remain in a valid state during iteration.
+    /// Modifying `LlistNode`s already returned by the iterator is okay.
+    pub unsafe fn iter_mut(sentinel: NonNull<Self>) -> IterMut<T> {
+        IterMut::new(
+            (*sentinel.as_ptr()).next.get(), 
+            (*sentinel.as_ptr()).prev.get()
+        )
     }
 }
 
 
 /// An iterator over the circular linked list `LlistNode`s, excluding the 'head'.
 ///
-/// This `struct` is created by `LlistNode<T>::iter_mut(self)`. See its documentation for more.
+/// This `struct` is created by `LlistNode::iter_mut`. See its documentation for more.
 #[derive(Debug, Clone, Copy)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct IterMut<'llist, T: 'llist> {
-    sentinel: NonNull<LlistNode<T>>,
-    next_forward: NonNull<LlistNode<T>>,
-    next_backward: NonNull<LlistNode<T>>,
-    prior_overlap: bool,
-    _phantom: PhantomData<&'llist ()>,
+pub struct IterMut<T> {
+    forward: NonNull<LlistNode<T>>,
+    backward: NonNull<LlistNode<T>>,
+    ongoing: bool,
 }
-
-impl<'llist, T> Iterator for IterMut<'llist, T> {
-    type Item = Pin<&'llist mut LlistNode<T>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.prior_overlap || self.next_forward == self.sentinel {
-            None
-        } else if self.next_forward == self.next_backward {
-            self.prior_overlap = true;
-            Some(unsafe {
-                // SAFETY: self.next_forward is never moved out of or into
-                // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias
-                Pin::new_unchecked(self.next_forward.as_mut())
-            })
-        } else {
-            let mut next_forward = unsafe {
-                // SAFETY: self.next_forward is never moved out of or into
-                // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias,
-                // implmentation guarantees that mutable references do not internally alias
-                Pin::new_unchecked(self.next_forward.as_mut())
-            };
-            // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias
-            self.next_forward = unsafe { next_forward.as_mut().next_mut().get_unchecked_mut() }.into();
-            Some(next_forward)
+impl<T> IterMut<T> {
+    /// Create a new iterator over a linked list.
+    /// ### Arguments:
+    /// * In the typical case of full list iteration, `start.prev` = `end`.
+    /// * `start` and `end` may be identical, in which case it will be yielded once.
+    /// * `start` and `end` may belong to different linked lists, this will result 
+    /// in an infinite iteration from both sides.
+    /// ### Safety:
+    /// `start`'s linked list must remain in a valid state during iteration.
+    /// Modifying `LlistNode`s already returned by the iterator is okay.
+    pub unsafe fn new(start: NonNull<LlistNode<T>>, end: NonNull<LlistNode<T>>) -> Self {
+        Self {
+            forward: start,
+            backward: end,
+            ongoing: true,
         }
     }
 }
 
-impl<'llist, T> DoubleEndedIterator for IterMut<'llist, T> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.prior_overlap || self.next_backward == self.sentinel {
-            None
-        } else if self.next_forward == self.next_backward {
-            self.prior_overlap = true;
-            Some(unsafe {
-                // SAFETY: self.next_forward is never moved out of or into
-                // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias
-                Pin::new_unchecked(self.next_backward.as_mut())
-            })
+impl<T> Iterator for IterMut<T> {
+    type Item = NonNull<LlistNode<T>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ongoing {
+            let ret = self.forward;
+            if self.forward == self.backward {
+                self.ongoing = false;
+            }
+            self.forward = unsafe { (*self.forward.as_ptr()).next.get() };
+            Some(ret)
         } else {
-            let mut next_backward = unsafe {
-                // SAFETY: self.next_forward is never moved out of or into
-                // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias,
-                // implmentation guarantees that mutable references do not internally alias
-                Pin::new_unchecked(self.next_backward.as_mut())
-            };
-            // SAFETY: iter_mut(...)'s caller guarantees nodes do not alias
-            self.next_backward = unsafe { next_backward.as_mut().prev_mut().get_unchecked_mut() }.into();
-            Some(next_backward)
+            None
+        }
+    }
+}
+
+impl<T> DoubleEndedIterator for IterMut<T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.ongoing {
+            let ret = self.backward;
+            if self.forward == self.backward {
+                self.ongoing = false;
+            }
+            self.backward = unsafe { (*self.backward.as_ptr()).prev.get() };
+            Some(ret)
+        } else {
+            None
         }
     }
 }
