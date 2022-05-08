@@ -1,5 +1,6 @@
 # just & sh build script
 # written to run on wsl, with qemu installed on windows
+# if you're on linux change qemu-system-x86_64.exe -> qemu-system-x86_64
 
 arch          := 'x86_64'
 config        := 'debug'
@@ -67,7 +68,7 @@ run profile='dev': (build profile)
         -drive if=pflash,format=raw,file=./dev/OVMF_CODE-pure-efi.fd,readonly=on \
         -drive if=pflash,format=raw,file=./dev/OVMF_VARS-pure-efi.fd,readonly=on \
         -machine q35 -cpu max -smp 4 -m 2G \
-        ./target/disk.img
+        -drive file=./target/disk.img,format=raw
 
     @echo ''
 

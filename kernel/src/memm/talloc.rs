@@ -2,79 +2,61 @@ use core::{
     ptr::{self, NonNull},
     alloc::{GlobalAlloc, Layout, Allocator, AllocError},
     fmt::Debug,
-    intrinsics::assume,
+    intrinsics::assume, ops::Range,
 };
-use crate::utils::llist::LlistNode;
+use crate::utils::{self, llist::LlistNode};
 use spin::{Mutex, MutexGuard};
 
-
-/// ### Safety:
-/// `val` must be nonzero
-#[inline]
-const unsafe fn fast_non0_log2(val: usize) -> usize {
-    assume(val != 0);
-    usize::BITS as usize - 1 ^ val.leading_zeros() as usize
-}
-/// ### Safety:
-/// `val` must be nonzero
-#[inline]
-const unsafe fn fast_non0_prev_pow2(val: usize) -> usize {
-    assume(val != 0);
-    1 << fast_non0_log2(val)
-}
-/// ### Safety:
-/// `val` must be nonzero 
-#[inline]
-const unsafe fn fast_non0_next_pow2(val: usize) -> usize {
-    assume(val != 0);
-    1 << u64::BITS - (val - 1).leading_zeros() 
-}
+/// Limit imposed by the AMD64 linear address space.
+pub const MAXIMUM_ARENA_SIZE: usize = 1 << 48;
 
 
 /// Returns whether the block of the given base is the lower of its buddy pair.
 #[inline]
 fn is_lower_buddy(block_base: *mut u8, size: usize) -> bool {
-    block_base.to_bits() & size == 0
-}
-/// Returns the offset in bits into the bitmap that indicates the block's buddy status.
-/// ### Safety:
-/// `size` must be nonzero
-#[inline]
-unsafe fn bitmap_offset(arena_base: usize, arena_size_pow2: usize, 
-block_base: usize, block_size: usize) -> usize {
-    // offset of the granularity into the field, plus, offset into the granularity
-    // arena_size_pow2 >> (log2(block_size) + 1), plus,
-    // block_size - (arena_base &!(size - 1)) >> (log2(block_size) + 1)
-    // Precalculating `arena_size_pow2`, approximately halves generated assembly.
-    arena_size_pow2 + (block_base - (arena_base & !(block_size - 1)))
-    >> fast_non0_log2(block_size) + 1
+    block_base as usize & size == 0
 }
 
 
-/// # `Talloc`
+/// # Talloc: The TauOS Allocator
 /// 
-/// ### Built to prioritise:
-/// * low time complexity and maximising performance at the cost of memory usage
-/// * minimization of external fragmentation at the cost of internal fragmentation
-/// * suitability for diverse use-cases
+/// ### Features:
+/// * Low time complexity and maximizing performance at the cost of memory usage
+/// * Minimization of external fragmentation at the cost of internal fragmentation
+/// * Arena can wrap around the address space, including `null` if desired.
+/// See below for more info.
 /// 
 /// ### Allocator design:
 /// * **O(log n)** worst case allocation and deallocation performance.
-/// * **O(2^n)** memory usage, where the 2^n component is at most `arena size / 128`.
-/// * **buddy allocation**: it uses a system of multiple levels of power-of-two size memory
-/// blocks which are split and joined to form smaller and larger allocatable blocks.
-/// * **linked-lists**: it uses arena-embedded free-lists to keep track of available memory.
-/// * **bitmap** employment: a field of bits to track block buddy status across granularities.
+/// * **O(2^n)** memory usage, at most `arena size / 128 + k`, where k is small.
+/// * **buddy allocation** thus will *always* allocate in powers of two.
+/// * **linked free-lists** the headers' slice must be stored seperately.
+/// * **bitmap**: the bitmap slice must be stored seperately.
+/// 
+/// Note that the extra slices can be stored within the arena, 
+/// as long as they remain reserved.
 /// 
 /// ### Allocator usage:
-/// Intantiation functions treat the arena as entirely reserved, allowing arenas to be created
-/// over memory that cannot be written to. However, attempting to allocate in this state will
-/// cause allocations to fail. 
-/// `Talloc::release` must be used, see its documentation for more.
+/// Intantiation functions treat the arena as entirely reserved, allowing arenas 
+/// to be created over memory invalid for reads/writes. However, attempting to 
+/// allocate in this state will fail. 
+/// * `Talloc::release` must be used, see its docs for more.
+/// * `Talloc::reserve` can be used thereafter, see it's docs for caveats.
+/// 
+/// 
+/// ### Null handling:
+/// Due to the fact that the arena is allowed to start at/overlap with zero/null, 
+/// this should be taken into account when releasing memory, as while the
+/// internal interface is happy to allocate valid zero-pointers, `GlobalAlloc`
+/// and `Allocator` interfaces do not allow this. The latter will error, the
+/// former will return the zero-pointer, however this is indistinguishable
+/// from the behaviour of running out of memory. Hence, do not `release`
+/// a span covering null if you wish to use these interfaces.
+/// Failing to do so is, however, safe.
 #[derive(Debug)]
 pub struct Talloc {
-    /// The base of the arena as an address.
-    arena_base: NonNull<u8>,
+    /// The base pointer of the arena.
+    arena_base: isize,
     /// The size of the arena in bytes.
     arena_size: usize,
     /// The next power-of-two size of the arena in bytes.
@@ -89,7 +71,7 @@ pub struct Talloc {
     avails: usize,
     /// The sentinels of the linked lists that each hold available fixed-size 
     /// memory blocks per granularity at an index.
-    llists: NonNull<[LlistNode<()>]>,
+    llists: *mut [LlistNode<()>],
     /// Describes occupation of memory blocks in the arena.
     /// 
     /// Bitfield of length `1 << llists.len()` in bits, where each granularity has a bit for each buddy,
@@ -98,7 +80,7 @@ pub struct Talloc {
     /// low addresses to high addresses.
     /// * Clear bit indicates homogeneity: both or neither are allocated.
     /// * Set bit indicated heterogeneity: one buddy is allocated.
-    bitmap: NonNull<[u8]>,
+    bitmap: *mut [u8],
 }
 
 impl Talloc {
@@ -114,12 +96,14 @@ impl Talloc {
     /// `size` must be nonzero
     #[inline]
     unsafe fn bitmap_offset(&self, base: *mut u8, size: usize) -> usize {
-        bitmap_offset(
-            self.arena_base.as_ptr().to_bits(), 
-            self.arena_size_pow2, 
-            base.to_bits(), 
-            size
-        )
+        // offset of the granularity's field, plus, offset into the field
+        // arena_size_pow2 >> (log2(block_size) + 1), plus,
+        // block_size - (arena_base &!(size - 1)) >> (log2(block_size) + 1)
+        // (Precalculating `arena_size_pow2`, approximately halves generated assembly.)
+        (
+            self.arena_size_pow2 + 
+            (base as isize - (self.arena_base & !(size as isize-1))) as usize
+        ) >> utils::fast_non0_log2(size)+1
     }
     /// Utility function to read the bitmap at the offset in bits.
     /// ### Safety:
@@ -128,7 +112,7 @@ impl Talloc {
     unsafe fn read_bitflag(&self, bitmap_offset: usize) -> bool {
         *self.bitmap.get_unchecked_mut(
             bitmap_offset >> u8::BITS.trailing_zeros()
-        ).as_ptr() as usize & 1 << (bitmap_offset & u8::BITS as usize - 1) != 0
+        ) & 1 << (bitmap_offset & u8::BITS as usize - 1) != 0
     }
     /// Utility function to toggle the bitmap at the offset in bits.
     /// ### Safety:
@@ -137,7 +121,7 @@ impl Talloc {
     unsafe fn toggle_bitflag(&mut self, bitmap_offset: usize) {
         *self.bitmap.get_unchecked_mut(
             bitmap_offset >> u8::BITS.trailing_zeros()
-        ).as_ptr() ^= 1 << (bitmap_offset & u8::BITS as usize - 1);
+        ) ^= 1 << (bitmap_offset & u8::BITS as usize - 1);
     }
 
     /// Registers a block into the books, making it available for allocation.
@@ -146,14 +130,14 @@ impl Talloc {
     /// `granularity`'s corresponding block size and `node`'s block base and size.
     #[inline]
     unsafe fn add_block_next(&mut self, granularity: usize, bitmap_offset: usize, 
-    node: NonNull<LlistNode<()>>) {
+    node: *mut LlistNode<()>) {
         // populating llist
         self.avails |= 1 << granularity;
 
         // add node to llist
         // SAFETY: guaranteed by caller
         let sentinel = self.llists.get_unchecked_mut(granularity);
-        LlistNode::new(node, sentinel, (*sentinel.as_ptr()).next.get(), ());
+        LlistNode::new(node, sentinel, (*sentinel).next.get(), ());
 
         // toggle bitmap flag
         // SAFETY: guaranteed by caller
@@ -168,20 +152,20 @@ impl Talloc {
     #[inline]
     unsafe fn remove_block_next(&mut self, granularity: usize, size: usize) -> *mut u8 {
         let sentinel = self.llists.get_unchecked_mut(granularity);
-        let node = (*sentinel.as_ptr()).next.get();
-        if (*node.as_ptr()).prev == (*node.as_ptr()).next {
+        if (*sentinel).prev == (*sentinel).next {
             // last nonsentinel block in llist, toggle off avails flag
             self.avails &= !(1 << granularity);
         }
         
         // remove node from llist
         // SAFETY: caller guaranteed
+        let node = (*sentinel).next.get();
         LlistNode::remove(node);
         
         // toggle bitmap flag
         // SAFETY: caller guaranteed
-        self.toggle_bitflag(self.bitmap_offset(node.as_ptr().cast(), size));
-        node.as_ptr().cast()
+        self.toggle_bitflag(self.bitmap_offset(node.cast(), size));
+        node.cast()
     }
     /// Unregisters a block from the free list, reserving it against allocation.
     /// 
@@ -192,8 +176,8 @@ impl Talloc {
     /// `granularity`'s corresponding block size and `node`'s block base and size.
     #[inline]
     unsafe fn remove_block(&mut self, granularity: usize, bitmap_offset: usize,
-    node: NonNull<LlistNode<()>>) {
-        if (*node.as_ptr()).prev == (*node.as_ptr()).next {
+    node: *mut LlistNode<()>) {
+        if (*node).prev == (*node).next {
             // last nonsentinel block in llist, toggle off avails flag
             self.avails &= !(1 << granularity);
         }
@@ -207,24 +191,50 @@ impl Talloc {
         self.toggle_bitflag(bitmap_offset);
     }
 
+    
+    /// Takes a `Layout` and outputs a block size that is:
+    /// * Nonzero
+    /// * A power of two
+    /// * Not smaller than smlst_block
+    /// * Not smaller than `layout.size`
+    /// * Sufficiently aligned
+    /// 
+    /// In other words, it ensures Talloc's size requirements are met.
+    /// 
+    /// ### Safety:
+    /// `layout.size` must be nonzero.
+    #[inline]
+    unsafe fn layout_to_size(&self, layout: Layout) -> usize {
+        // Get the maximum between the required size as a power of two, the smallest allocatable,
+        // and the alignment. The alignment being larger than the size is a rather esoteric case,
+        // which is handled by simply allocating a larger size with the required alignment. This
+        // may be highly memory inefficient for very bizarre scenarios.
+        utils::fast_non0_prev_pow2( // SAFETY: caller guaranteed
+            utils::fast_non0_next_pow2(layout.size())
+            | layout.align()
+            | self.smlst_block
+        )
+    }
+
+
 
     /// Guaratees the following:
-    /// * `arena_size` and `smallest_allocatable_size` is non-zero.
+    /// * `arena_size` and `smallest_allocatable_size` are > zero.
     /// * `arena_size.next_power_of_two()` does not overflow.
     /// * `smallest_block` is a powers of two.
-    /// * `smallest_block` is larger or equal to the size of a `LlistNode<()>`
+    /// * `smallest_block` is larger or equal to the size of a `LlistNode<()>`.
     /// * `LlistNode<()>` has the expected size.
     fn validate_arena_args(arena_size: usize, smallest_block: usize) {
         use core::mem;
         
-        assert!(arena_size != 0,
-            "arena_size must be non-zero.");
-        assert!(arena_size <= 1 << usize::BITS - 1,
-            "arena_size.next_power_of_two() may not overflow.");
-        assert!(smallest_block != 0,
-            "smallest_block must be non-zero.");
+        assert!(arena_size > 0,
+            "arena_size must be > zero.");
+        assert!(arena_size <= MAXIMUM_ARENA_SIZE,
+            "arena_size must be <= talloc::MAXIMUM_ARENA_SIZE.");
+        assert!(smallest_block > 0,
+            "smallest_block must be > zero.");
         assert!(smallest_block.count_ones() == 1,
-            "smallest_block must be a power of 2.");
+            "smallest_block must be a power of two.");
         
         assert!(mem::size_of::<*mut u8>() * 2 == mem::size_of::<LlistNode<()>>());
         assert!(smallest_block >= mem::size_of::<LlistNode<()>>(),
@@ -238,7 +248,7 @@ impl Talloc {
         // validate_arena_args guarantees `arena_size` and `smallest_block` are non-zero
         // and that `arena_size.next_power_of_two()` does not overflow
         let llists_len = ((arena_size - 1).log2() + 1) - smallest_block.log2() + 1;
-        let bitmap_len = 1usize << llists_len >> u8::BITS.trailing_zeros() as usize;
+        let bitmap_len = 1usize << llists_len >> u8::BITS.trailing_zeros();
 
         (llists_len as usize, if bitmap_len != 0 { bitmap_len } else { 1 })
     }
@@ -246,39 +256,32 @@ impl Talloc {
     /// Create a new `Talloc`.
     /// ### Arguments:
     /// * `llists`'s and `bitmap`'s lengths should equal `Talloc::slice_lengths`'s values.
-    /// * `smallest_block` should be a power of two greater than the size of two pointers.
-    /// * `arena_base + arena_size` should not overflow to greater than zero.
-    /// * `arena_size` should be non-zero.
-    /// * `arena_size.next_power_of_two()` should not overflow.
-    /// 
-    /// Failure to meet these requirements will result in a panic!
-    pub fn new(arena_base: NonNull<u8>, arena_size: usize, smallest_block: usize,
-    llists: NonNull<[LlistNode<()>]>, bitmap: NonNull<[u8]>) -> Self {
+    /// * `16 <= smallest_block`
+    /// * `0 < arena_size <= MAXIMUM_ARENA_SIZE`
+    /// * The arena may wrap around the address space.
+    pub fn new(arena_base: *mut u8, arena_size: usize, smallest_block: usize,
+    llists: *mut [LlistNode<()>], bitmap: *mut [u8]) -> Self {
         // verify arena validity
         Self::validate_arena_args(arena_size, smallest_block);
-        // ensure against overflow greater than zero
-        assert!(arena_base.as_ptr().to_bits().checked_add(arena_size - 1).is_some());
-
         // verify slice lengths' validity
-        let (llists_len, bitmap_len) = Self::slice_lengths(arena_size, smallest_block);
-        assert_eq!(llists_len, llists.len());
-        assert_eq!(bitmap_len, bitmap.len());
+        let slice_lengths = Self::slice_lengths(arena_size, smallest_block);
+        assert_eq!(slice_lengths.0, llists.len());
+        assert_eq!(slice_lengths.1, bitmap.len());
 
         // initialize slices
         unsafe {
             bitmap.as_mut_ptr().write_bytes(0, bitmap.len());
             for i in 0..llists.len() {
-                LlistNode::new_llist(NonNull::new_unchecked(
-                    llists.as_mut_ptr().wrapping_add(i)), ()
-                );
+                LlistNode::new_llist(llists.as_mut_ptr().wrapping_add(i), ());
             }
         }
 
+        let arena_size_pow2 = (arena_size as usize).next_power_of_two();
         Self {
-            arena_base,
-            arena_size,
-            arena_size_pow2: arena_size.next_power_of_two(),
-            arena_size_pow2_lzcnt: arena_size.next_power_of_two().leading_zeros(),
+            arena_base: arena_base as isize,
+            arena_size: arena_size,
+            arena_size_pow2: arena_size_pow2,
+            arena_size_pow2_lzcnt: arena_size_pow2.leading_zeros(),
             smlst_block: smallest_block,
             avails: 0,
             llists,
@@ -289,52 +292,40 @@ impl Talloc {
 
 
     /// Returns a closed range describing the span of memory conservatively 
-    /// in terms of smallest allocatable units.
+    /// in terms of smallest allocatable units. Address-space wraparound is allowed.
     /// 
     /// A primary use case for this bounding method is the releasing of the 
     /// arena according to available blocks of memory. Conservative bounding 
     /// ensures that only available memory is described as available.
     /// ### Arguments:
-    /// * `base.to_bits() + size` may overflow to zero.
-    /// * `size` can be zero.
+    /// * `size` should not be smaller than `smallest_block`.
     #[inline]
-    pub fn bound_available(&self, base: *mut u8, size: usize) -> (*mut u8, *mut u8) {
-        let sbm1 = self.smlst_block - 1;
-        if size < self.smlst_block {
-            (   // return zero-length range, this is checked for later
-                <*mut u8>::from_bits(base.to_bits() & !sbm1), 
-                <*mut u8>::from_bits(base.to_bits() & !sbm1),
-            )
-        } else {
-            (   // round up to first smlst block contained in the range
-                <*mut u8>::from_bits(base.to_bits() + sbm1 & !sbm1),
-                // last partial smlst block - 1
-                <*mut u8>::from_bits((base.to_bits() + (size - self.smlst_block) & !sbm1) + sbm1)
-            )
-        }
+    pub fn bound_available(&self, base: *mut u8, size: usize) -> Range<isize> {
+        assert!(size >= self.smlst_block);
+        let sbm1 = (self.smlst_block-1) as isize;
+        
+        (base as isize + sbm1 & !sbm1)..
+        (base as isize + size as isize & !sbm1)
     }
     /// Returns a closed range describing the span of memory liberally 
-    /// in terms of smallest allocatable units.
+    /// in terms of smallest allocatable units. Address-space wraparound is allowed.
     /// 
     /// A primary use case for this bounding method is the reserving and 
     /// subsequent releasing of memory within the arena once already released. 
     /// Liberal bounding ensures that no unavailable memory is described as available.
     /// ### Arguments:
-    /// `base.to_bits() + size` may overflow to zero.
-    /// * `size` can be zero.
+    /// * `size` should not be zero, but it can be smaller than `smallest_block`.
     #[inline]
-    pub fn bound_reserved(&self, base: *mut u8, mut size: usize) -> (*mut u8, *mut u8) {
-        if size == 0 { size = 1; }
-        let sbm1 = self.smlst_block - 1;
+    pub fn bound_reserved(&self, base: *mut u8, size: usize) -> Range<isize> {
+        assert!(size != 0);
+        let sbm1 = (self.smlst_block-1) as isize;
 
-        (   // round down to first smlst block containing the range
-            <*mut u8>::from_bits(base.to_bits() & !sbm1),
-            // last partial smlst block + smb1
-            <*mut u8>::from_bits((base.to_bits() + (size - 1) & !sbm1) + sbm1)
-        )
+        (base as isize & !sbm1)..
+        (base as isize + size as isize + sbm1 & !sbm1)
     }
 
-    /// Reserve released memory against use within `span`.
+    /// Reserve released memory against use within half-open `span`.
+    /// Address-space wraparound is allowed.
     /// 
     /// `span` is expected to be the result of `bound_available(...)` 
     /// or `bound_reserved(...)`.
@@ -346,56 +337,55 @@ impl Talloc {
     /// 
     /// ### Safety:
     /// The memory within `bound` must be entirely available for allocation.
-    pub unsafe fn reserve(&mut self, span: (*mut u8, *mut u8)) {
+    pub unsafe fn reserve(&mut self, span: Range<isize>) {
         // Strategy:
-        // - Loop through all available block nodes to the smallest granularity possible given bound alignment
+        // - Loop through all available block nodes to the smallest granularity 
+        //   possible given bound alignment
         // - On encountering a fully contained block, reserve it
-        // - On encountering a partially contained block, break it down, reserving it within the bound
-        //   - This is similar to the allocation routine of breaking down a block
+        // - On encountering a partially contained block, break it down, 
+        //   reserving it within the bound
 
         // validity checks
-        debug_assert!(span.0 != span.1);
-        debug_assert!(span.0 >= self.arena_base.as_ptr());
-        debug_assert!(span.1 <= self.arena_base.as_ptr().add(self.smlst_block - 1));
-        debug_assert!(span.0.to_bits() & self.smlst_block - 1 == 0);
-        debug_assert!(span.1.to_bits() & self.smlst_block - 1 == self.smlst_block - 1);
+        debug_assert!(span.start != span.end);
+        debug_assert!(span.start >= self.arena_base);
+        debug_assert!(span.end <= (self.arena_base + self.arena_size as isize));
+        debug_assert!(span.start as usize & self.smlst_block-1 == 0);
+        debug_assert!(span.end as usize & self.smlst_block-1 == 0);
 
         // Caller guarantees that no allocations are made within the span, and
         // that all memory therein is available. Hence it can be assumed that all 
         // relevant blocks will be aligned at least as well as the bounds. Thus 
         // greater granularities than that of the bounds need not be checked.
-        let base_granularity = self.block_granularity(
-            1 << span.0.to_bits().trailing_zeros());
-        let acme_granularity = self.block_granularity(
-            1 << span.1.to_bits().wrapping_add(1).trailing_zeros());
+        let base_granularity = self.block_granularity(1 << span.start.trailing_zeros());
+        let acme_granularity = self.block_granularity(1 << span.end.trailing_zeros());
         let finest_granularity = base_granularity.max(acme_granularity);
         
         let mut block_size = self.arena_size_pow2;
         for granularity in 0..finest_granularity {
             let sentinel = self.llists.get_unchecked_mut(granularity);
             for node in LlistNode::iter_mut(sentinel) {
-                let block_base = node.as_ptr().cast::<u8>();
-                let block_end = block_base.add(block_size - 1);
+                let block_base = node as isize;
+                let block_end = block_base + block_size as isize;
                 
-                if span.0 <= block_base && span.1 > block_end {
+                if span.start <= block_base && block_end <= span.end {
                     // this block is entirely reserved
                     self.remove_block(
                         granularity, 
-                        self.bitmap_offset(block_base, block_size), 
+                        self.bitmap_offset(block_base as *mut _, block_size), 
                         node
                     );
 
                     // return if block represents the entire reserved area
-                    if span.0 == block_base && span.1 == block_end { return; }
+                    if span.start == block_base && span.end == block_end { return; }
                 } else {
                     // handle partial containment cases
-                    let is_first_contained = span.0 > block_base && span.1 < block_end;
-                    let is_last_contained = span.0 > block_base && span.1 < block_end;
+                    let is_first_contained = block_base < span.start && span.start < block_end;
+                    let is_last_contained = block_base < span.end && span.end < block_end;
 
                     if is_first_contained || is_last_contained {
                         self.remove_block(
                             granularity, 
-                            self.bitmap_offset(block_base, block_size), 
+                            self.bitmap_offset(block_base as *mut _, block_size), 
                             node
                         );
                     }
@@ -403,34 +393,34 @@ impl Talloc {
                     if is_first_contained {
                         // restore free memory from the bottom
                         let mut base = block_base;
-                        let mut delta = span.0.to_bits() - base.to_bits();
+                        let mut delta = (span.start - base) as usize;
                         while delta > 0 {
-                            let block_size = fast_non0_prev_pow2(delta);
+                            let block_size = utils::fast_non0_prev_pow2(delta);
                             delta -= block_size;
 
                             self.add_block_next(
                                 self.block_granularity(block_size),
-                                self.bitmap_offset(base, block_size),
-                                NonNull::new_unchecked(base.cast()),
+                                self.bitmap_offset(base as *mut _, block_size),
+                                base as *mut _,
                             );
 
-                            base = base.add(block_size);
+                            base += block_size as isize;
                         }
                     }
                     
                     if is_last_contained {
                         // restore free memory from the top
-                        let mut end = block_end;
-                        let mut delta = end.to_bits() - span.0.to_bits();
+                        let mut acme = block_end;
+                        let mut delta = (acme - span.start) as usize;
                         while delta > 0 {
-                            let block_size = fast_non0_prev_pow2(delta);
+                            let block_size = utils::fast_non0_prev_pow2(delta);
                             delta -= block_size;
-                            end = end.sub(block_size);
+                            acme -= block_size as isize;
 
                             self.add_block_next(
                                 self.block_granularity(block_size),
-                                self.bitmap_offset(end.add(1), block_size),
-                                NonNull::new_unchecked(end.cast()),
+                                self.bitmap_offset(acme as *mut _, block_size),
+                                acme as *mut _,
                             );
                         }
                     }
@@ -440,14 +430,15 @@ impl Talloc {
         }
     }
 
-    /// Release reserved memory for use within `span`.
+    /// Release reserved memory for use within half-open `span`.
+    /// Address-space wraparound is allowed.
     /// 
     /// `span` is expected to be the result of `bound_available(...)` 
     /// or `bound_reserved(...)`.
     /// ### Safety:
     /// * The memory inclusively within `bound` must be unallocatable (reserved).
     /// * All the memory inclusively within `bound` must be safely readable and writable.
-    pub unsafe fn release(&mut self, span: (*mut u8, *mut u8)) {
+    pub unsafe fn release(&mut self, span: Range<isize>) {
         // Strategy:
         // - Start address at the base of the bounds
         // - Allocate as large a block as possible repeatedly, bump address
@@ -455,110 +446,100 @@ impl Talloc {
         // - Allocate the previous power of two of the delta between current address and top + smlst, bump address
         // - When the delta is zero, the bounds have been entirely filled
 
-        if span.0 == span.1 { return; }
-
         // validity checks
-        debug_assert!(span.0 >= self.arena_base.as_ptr());
-        debug_assert!(span.1 <= self.arena_base.as_ptr().add(self.smlst_block - 1));
-        debug_assert!(span.0.to_bits() & self.smlst_block - 1 == 0);
-        debug_assert!(span.1.to_bits() & self.smlst_block - 1 == self.smlst_block - 1);
+        debug_assert!(span.start != span.end);
+        debug_assert!(span.start >= self.arena_base);
+        debug_assert!(span.end <= (self.arena_base + self.arena_size as isize));
+        debug_assert!(span.start as usize & self.smlst_block-1 == 0);
+        debug_assert!(span.end as usize & self.smlst_block-1 == 0);
         
-        let mut base = span.0;
+        let mut base = span.start;
         let mut asc_block_sizes = true;
         loop {
             let block_size = if asc_block_sizes {
-                let block_size = 1usize << base.to_bits().trailing_zeros();
+                let block_size = 1 << base.trailing_zeros();
 
-                if base.add(block_size - 1) <= span.1 {
+                if base + block_size as isize <= span.end {
                     block_size
                 } else {
                     asc_block_sizes = false;
                     continue;
                 }
             } else {
-                let delta = span.1.to_bits() - base.to_bits() + 1;
+                let delta = (span.end - base) as usize;
                 if delta >= self.smlst_block {
                     // SAFETY: smlst_block is never zero
-                    fast_non0_prev_pow2(delta)
+                    utils::fast_non0_prev_pow2(delta)
                 } else {
                     break;
                 }
             };
             
             // SAFETY: deallocating reserved memory is valid and memory safe
-            self.dealloc(
-                base,
-                Layout::from_size_align_unchecked(block_size, 1)
-            );
+            self.dealloc(base as *mut u8, block_size);
 
-            base = base.add(block_size);
+            base += block_size as isize;
         }
     }
 
     
-    /// Allocate memory as described by the given layout.
+    /// Allocate memory. 
     /// 
-    /// Returns null to indicate memory exhaustion.
+    /// Allocations are guaranteed to be a power of two in size, size-aligned,
+    /// not smaller than `layout.size()`.
+    /// 
+    /// Returns `Err` upon memory exhaustion.
+    /// May return a *valid* zero-pointer. See `Talloc` docs for more info.
     /// ### Safety:
-    /// `layout`'s size must be non-zero.
-    pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+    /// * `size` must be a nonzero power of two.
+    /// * `size` must not be smaller than `smallest_block`.
+    pub unsafe fn alloc(&mut self, size: usize) -> Result<*mut u8, AllocError> {
         // SAFETY: caller guaranteed
-        assume(layout.size() != 0);
-
-        // Get the maximum between the required size as a power of two, the smallest allocatable,
-        // and the alignment. The alignment being larger than the size is a rather esoteric case,
-        // which is handled by simply allocating a larger size with the required alignment. This
-        // may be highly memory inefficient for very bizarre scenarios.
-        let size = fast_non0_prev_pow2( // SAFETY: val is never zero
-            fast_non0_next_pow2(layout.size())
-            | layout.align()
-            | self.smlst_block
-        );
+        assume(size != 0);
+        assume(size.is_power_of_two());
+        
         let granularity = self.block_granularity(size);
 
         // Allocate immediately if a block of the correct size is available
         if self.avails & 1 << granularity != 0 {
-            return self.remove_block_next(granularity, size) as *mut u8;
+            return Ok(self.remove_block_next(granularity, size) as *mut u8);
         }
 
-        // find a larger block to break apart - mask out bits for smaller blocks
+        // find a larger block to break apart:
         let larger_avl = self.avails & !(usize::MAX << granularity);
-        if larger_avl == 0 { return ptr::null_mut(); } // not enough memory
+        if larger_avl == 0 { return Err(AllocError); } // not enough memory
         
-        let lgr_granularity = fast_non0_log2(larger_avl);
+        let lgr_granularity = utils::fast_non0_log2(larger_avl);
         let lgr_size = self.arena_size_pow2 >> lgr_granularity;
         let lgr_base = self.remove_block_next(lgr_granularity, lgr_size);
 
+        // break down the large block into smaller blocks
         let mut hi_block_size = lgr_size >> 1;
-        // break down the large block into smaller blocks until the required size is reached
         for hi_granularity in (lgr_granularity + 1)..=granularity {
             let hi_block_base = lgr_base.wrapping_add(hi_block_size);
 
+            // SAFETY: https://yewtu.be/watch?v=rp8hvyjZWHs
             self.add_block_next(
                 hi_granularity,
                 self.bitmap_offset(hi_block_base, hi_block_size),
-                NonNull::new_unchecked(hi_block_base.cast())
+                hi_block_base.cast()
             );
 
             hi_block_size >>= 1;
         }
 
-        lgr_base
+        Ok(lgr_base)
     }
 
     /// Deallocate the block of memory.
     /// ### Safety:
-    /// `ptr` must have been previously acquired, given `layout`.
-    pub unsafe fn dealloc(&mut self, mut ptr: *mut u8, layout: Layout) {
+    /// `ptr` must have been previously acquired, given `size`.
+    pub unsafe fn dealloc(&mut self, mut ptr: *mut u8, mut size: usize) {
         // SAFETY: caller guaranteed
-        assume(layout.size() != 0);
+        assume(size != 0);
+        assume(size.is_power_of_two());
 
-        // Same process as allocate(), see docs there for rationale
-        let mut size = fast_non0_prev_pow2(
-            fast_non0_next_pow2(layout.size())
-            | layout.align()
-            | self.smlst_block
-        );
+        //let mut size = size as isize;
         let mut granularity = self.block_granularity(size);
         let mut bitmap_offset = self.bitmap_offset(ptr, size);
         
@@ -566,18 +547,18 @@ impl Talloc {
             let buddy_ptr: *mut u8;
             let next_ptr: *mut u8;
             if is_lower_buddy(ptr, size) {
-                buddy_ptr = ptr.add(size);
+                buddy_ptr = ptr.wrapping_add(size);
                 next_ptr = ptr;
             } else {
-                buddy_ptr = ptr.sub(size);
-                next_ptr = ptr.sub(size);
+                buddy_ptr = ptr.wrapping_sub(size);
+                next_ptr = ptr.wrapping_sub(size);
             }
 
             // SAFETY: buddy has been confirmed to exist here, LlistNodes are not moved
             self.remove_block(
                 granularity, 
                 bitmap_offset, 
-                NonNull::new_unchecked(buddy_ptr.cast())
+                buddy_ptr.cast()
             );
             
             size <<= 1;
@@ -589,120 +570,106 @@ impl Talloc {
         self.add_block_next(
             granularity, 
             bitmap_offset, 
-            NonNull::new_unchecked(ptr.cast())
+            ptr.cast()
         );
     }
 
     /// Grow the block of memory provided.
     /// 
-    /// Returns null to indicate memory exhaustion.
+    /// Allocations are guaranteed to be a power of two in size, size-aligned,
+    /// not smaller than `new_layout.size()`.
     /// 
-    /// Books must be initialized.
+    /// Returns `Err` upon memory exhaustion. 
+    /// May return a *valid* null pointer. See `Talloc` docs for more info.
     /// ### Safety:
-    /// * `new_layout`'s size must be larger than or equal to `old_layout`'s.
-    /// * `old_layout` and `new_layout`'s sizes must be non-zero.
-    /// * `ptr` must have been previously acquired, given `old_layout`.
-    pub unsafe fn grow(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
+    /// * Both sizes must be nonzero powers of two not smaller than `smallest_block`.
+    /// * `old_size` must be smaller than `new_size`.
+    /// * `ptr` must have been previously acquired, given `old_size`.
+    pub unsafe fn grow(&mut self, ptr: *mut u8, old_size: usize, new_size: usize)
+    -> Result<*mut u8, AllocError> {
         // SAFETY: caller guaranteed
-        assume(old_layout.size() != 0);
-        assume(new_layout.size() != 0);
-
-        let old_size = fast_non0_prev_pow2(
-            fast_non0_next_pow2(old_layout.size())
-            | old_layout.align()
-            | self.smlst_block
-        );
-        let tgt_size = fast_non0_prev_pow2(
-            fast_non0_next_pow2(new_layout.size())
-            | new_layout.align()
-            | self.smlst_block
-        );
+        assume(old_size != 0);
+        assume(old_size.is_power_of_two());
+        assume(new_size != 0);
+        assume(new_size.is_power_of_two());
 
         let old_granularity = self.block_granularity(old_size);
-        let new_granularity = self.block_granularity(tgt_size);
+        let new_granularity = self.block_granularity(new_size);
         
-        if tgt_size > old_size {
-            // size is bigger, check hi buddies recursively, if available, reserve them, else alloc and dealloc
-            // follows a remotely similar routine to dealloc
+        // Check high buddies recursively, if available, reserve them, else realloc.
+        // This satisfies the requirement on Allocator::grow that the memory
+        // must not be modified or reclaimed if Err is returned.
 
-            let mut size = old_size;
-            let mut bitmap_offset = self.bitmap_offset(ptr, size);
-            let mut granularity = old_granularity;
+        let mut size = old_size;
+        let mut bitmap_offset = self.bitmap_offset(ptr, size);
+        let mut granularity = old_granularity;
 
-            while granularity > new_granularity {
-                // if this is a high buddy, and a further larger block is required, slow realloc is necessary
-                // if the high buddy is not available and a further larger block is required, slow realloc is necessary
-                if !is_lower_buddy(ptr, size) || !self.read_bitflag(bitmap_offset) {
-                    let allocd = self.alloc(new_layout);
-                    if allocd != ptr::null_mut() {
-                        ptr::copy_nonoverlapping(ptr, allocd, old_layout.size());
-                        self.dealloc(ptr, old_layout);
-                    }
-                    return allocd;
+        while granularity > new_granularity {
+            // realloc is necessary:
+            // * if this is a high buddy and a larger block is required
+            // * if the high buddy is not available and a larger block is required
+            if !is_lower_buddy(ptr, size) || !self.read_bitflag(bitmap_offset) {
+                let allocation = self.alloc(new_size);
+                if let Ok(alloc_ptr) = allocation {
+                    ptr::copy_nonoverlapping(ptr, alloc_ptr, old_size);
+                    self.dealloc(ptr, old_size);
                 }
-                
-                size <<= 1;
-                granularity -= 1;
-                bitmap_offset = self.bitmap_offset(ptr, size);
+                return allocation;
             }
-
-            // reiterate, with confidence that there is enough available space to be able to realloc in place
-            // remove all available buddy nodes as necessary
-            let mut size = old_size;
-            let mut granularity = old_granularity;
-            while granularity > new_granularity {
-                self.remove_block(
-                    granularity,
-                    self.bitmap_offset(ptr, size),
-                    NonNull::new_unchecked(ptr.add(size).cast())
-                );
-
-                size <<= 1;
-                granularity -= 1;
-            }
+            
+            size <<= 1;
+            granularity -= 1;
+            bitmap_offset = self.bitmap_offset(ptr, size);
         }
 
-        ptr
+        // reiterate, having confirmed there is sufficient memory available
+        // remove all buddy nodes as necessary
+        let mut size = old_size;
+        let mut granularity = old_granularity;
+        while granularity > new_granularity {
+            self.remove_block(
+                granularity,
+                self.bitmap_offset(ptr, size),
+                ptr.wrapping_add(size).cast()
+            );
+
+            size <<= 1;
+            granularity -= 1;
+        }
+
+        Ok(ptr)
     }
 
     /// Shrink the block of memory provided.
+    /// 
+    /// Allocations are guaranteed to be a power of two in size, size-aligned,
+    /// not smaller than `new_layout.size()`.
     /// ### Safety:
-    /// * `new_layout`'s size must be smaller than or equal to `old_layout`'s.
-    /// * `old_layout` and `new_layout`'s sizes must be non-zero.
-    /// * `ptr` must have been previously acquired, given `old_layout`.
-    pub unsafe fn shrink(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
+    /// * Both sizes must be nonzero powers of two not smaller than `smallest_block`.
+    /// * `old_size` must be larger than `new_size`.
+    /// * `ptr` must have been previously acquired, given `old_size`.
+    pub unsafe fn shrink(&mut self, ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
         // SAFETY: caller guaranteed
-        assume(old_layout.size() != 0);
-        assume(new_layout.size() != 0);
-
-        let old_size = fast_non0_prev_pow2(
-            fast_non0_next_pow2(old_layout.size())
-            | old_layout.align()
-            | self.smlst_block
-        );
-        let tgt_size = fast_non0_prev_pow2(
-            fast_non0_next_pow2(new_layout.size())
-            | new_layout.align()
-            | self.smlst_block
-        );
+        assume(old_size != 0);
+        assume(old_size.is_power_of_two());
+        assume(new_size != 0);
+        assume(new_size.is_power_of_two());
         
-        if tgt_size < old_size {
-            // if size is smaller, break up the block until the required size is reached
+        // break up the block until the required size is reached
+        let old_granularity = self.block_granularity(old_size);
+        let new_granularity = self.block_granularity(new_size);
 
-            let old_granularity = self.block_granularity(old_size);
-            let new_granularity = self.block_granularity(tgt_size);
+        let mut hi_block_size = old_size >> 1;
+        for hi_granularity in (old_granularity + 1)..=new_granularity {
+            let hi_block_base = ptr.wrapping_add(hi_block_size);
 
-            let mut hi_block_size = old_size >> 1;
-            for hi_granularity in (old_granularity + 1)..=new_granularity {
-                let hi_block_base = ptr.add(hi_block_size);
-                self.add_block_next(
-                    hi_granularity,
-                    self.bitmap_offset(hi_block_base, hi_block_size),
-                    NonNull::new_unchecked(hi_block_base.cast())
-                );
+            self.add_block_next(
+                hi_granularity,
+                self.bitmap_offset(hi_block_base, hi_block_size),
+                hi_block_base.cast()
+            );
 
-                hi_block_size >>= 1;
-            }
+            hi_block_size >>= 1;
         }
 
         ptr
@@ -727,30 +694,32 @@ impl Tallock {
     /// It is undefined behaviour to access fields/call any methods on the result hereof.
     pub const unsafe fn new_invalid() -> Self {
         Self(Mutex::new(Talloc {
-            smlst_block: 0,
-            arena_base: NonNull::dangling(),
+            arena_base: 0,
             arena_size_pow2: 0,
             arena_size_pow2_lzcnt: 0,
             arena_size: 0,
+            smlst_block: 0,
             avails: 0,
-            llists: NonNull::<[_; 0]>::dangling(),
-            bitmap: NonNull::<[_; 0]>::dangling(),
+            llists: NonNull::<[_; 0]>::dangling().as_ptr(),
+            bitmap: NonNull::<[_; 0]>::dangling().as_ptr(),
         }))
     }
 
     /// Create a new `Tallock`. Access the inner `Talloc` via `.lock()`.
-    /// 
     /// ### Arguments:
-    /// * `llists`'s and `bitmap`'s lengths should match `Talloc::slice_lengths`.
-    /// * `smallest_block` should be a power of two >= than the size of two pointers.
-    /// * `arena_base + arena_size` should not overflow to greater than zero.
-    /// * `arena_size` should be non-zero.
-    /// * `arena_size.next_power_of_two()` should not overflow.
-    /// 
-    /// Failing to meet these requirements will result in a panic.
-    pub fn new(arena_base: NonNull<u8>, arena_size: usize, smallest_block: usize,
-    llists: NonNull<[LlistNode<()>]>, bitmap: NonNull<[u8]>) -> Self {
-        Self(Mutex::new(Talloc::new(arena_base, arena_size, smallest_block, llists, bitmap)))
+    /// * `llists`'s and `bitmap`'s lengths should equal `Talloc::slice_lengths`'s values.
+    /// * `16 <= smallest_block`
+    /// * `0 < arena_size <= MAXIMUM_ARENA_SIZE`
+    /// * The arena may wrap around the address space.
+    pub fn new(arena_base: *mut u8, arena_size: usize, smallest_block: usize,
+    llists: *mut [LlistNode<()>], bitmap: *mut [u8]) -> Self {
+        Self(Mutex::new(Talloc::new(
+            arena_base, 
+            arena_size, 
+            smallest_block, 
+            llists, 
+            bitmap,
+        )))
     }
 
     /// Acquire the lock on the `Talloc`.
@@ -761,23 +730,43 @@ impl Tallock {
 }
 
 unsafe impl GlobalAlloc for Tallock {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { self.lock().alloc(layout) }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { self.lock().dealloc(ptr, layout) }
-
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut talloc = self.lock();
+        let size = talloc.layout_to_size(layout);
+        talloc.alloc(size).unwrap_or(core::ptr::null_mut())
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let mut talloc = self.lock();
+        let size = talloc.layout_to_size(layout);
+        talloc.dealloc(ptr, size);
+    }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.lock().alloc(layout);
+        let mut talloc = self.lock();
+        // SAFETY: caller guaranteed
+        let size = talloc.layout_to_size(layout);
+        let ptr = talloc.alloc(size).unwrap_or(core::ptr::null_mut());
+
         if !ptr.is_null() {
             ptr.write_bytes(0, layout.size());
         }
         ptr
     }
-
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
-        let new_layout = Layout::from_size_align_unchecked(new_size, old_layout.align());
-        if new_size > old_layout.size() {
-            self.lock().grow(ptr, old_layout, new_layout)
+        let talloc = self.lock();
+        // SAFETY: caller guaranteed
+        let old_size = talloc.layout_to_size(old_layout);
+        let new_size = utils::fast_non0_prev_pow2(
+            utils::fast_non0_next_pow2(new_size)
+            | talloc.smlst_block
+        );
+
+        if old_size < new_size {
+            self.lock().grow(ptr, old_size, new_size)
+                .unwrap_or(core::ptr::null_mut())
+        } else if old_size > new_size {
+            self.lock().shrink(ptr, old_size, new_size)
         } else {
-            self.lock().shrink(ptr, old_layout, new_layout)
+            ptr
         }
     }
 }
@@ -785,9 +774,14 @@ unsafe impl GlobalAlloc for Tallock {
 unsafe impl Allocator for Tallock {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() != 0 {
-            match NonNull::new(unsafe { self.lock().alloc(layout) }) {
-                Some(ptr) => Ok(NonNull::slice_from_raw_parts(ptr, layout.size())),
-                None => Err(AllocError),
+            let mut talloc = self.lock();
+            // SAFETY: layout.size is nonzero
+            let size = unsafe { talloc.layout_to_size(layout) };
+            let allocated = unsafe { talloc.alloc(size)? };
+            if let Some(ptr) = NonNull::new(allocated) {
+                Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+            } else {
+                panic!("Null pointer returned by Talloc through Allocator interface.")
             }
         } else {
             Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0))
@@ -795,17 +789,30 @@ unsafe impl Allocator for Tallock {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        self.lock().dealloc(ptr.as_ptr(), layout)
+        if ptr != NonNull::dangling() {
+            let mut talloc = self.lock();
+            // SAFETY: layout.size() is not nonzero if ptr not dangling
+            let size = talloc.layout_to_size(layout);
+            talloc.dealloc(ptr.as_ptr(), size)
+        }
     }
 
     unsafe fn grow(&self, ptr: NonNull<u8>, old_layout: Layout, new_layout: Layout)
     -> Result<NonNull<[u8]>, AllocError> {
-        debug_assert!(new_layout.size() >= old_layout.size());
-
         if old_layout.size() != 0 {
-            match NonNull::new(self.lock().grow(ptr.as_ptr(), old_layout, new_layout)) {
-                Some(ptr) => Ok(NonNull::slice_from_raw_parts(ptr, new_layout.size())),
-                None => Err(AllocError),
+            let talloc = self.lock();
+            // SAFETY: caller guaranteed
+            let old_size = talloc.layout_to_size(old_layout);
+            let new_size = talloc.layout_to_size(new_layout);
+
+            let growed = self.lock().grow(ptr.as_ptr(), old_size, new_size)?;
+            if let Some(ptr) = NonNull::new(growed) {
+                Ok(NonNull::slice_from_raw_parts(
+                    ptr, 
+                    new_layout.size()
+                ))
+            } else {
+                panic!("Null pointer returned by Talloc through Allocator interface.")
             }
         } else {
             self.allocate(new_layout)
@@ -814,37 +821,30 @@ unsafe impl Allocator for Tallock {
 
     unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old_layout: Layout, new_layout: Layout)
     -> Result<NonNull<[u8]>, AllocError> {
-        debug_assert!(new_layout.size() >= old_layout.size());
-
-        if old_layout.size() != 0 {
-            let growed = NonNull::slice_from_raw_parts(
-                NonNull::new_unchecked(
-                    self.lock().grow(ptr.as_ptr(), old_layout, new_layout)
-                ),
-                new_layout.size()
-            );
-            growed.as_non_null_ptr().as_ptr().add(old_layout.size())
-                .write_bytes(0, new_layout.size() - old_layout.size());
-            Ok(growed)
-        } else {
-            Ok(NonNull::slice_from_raw_parts(
-                NonNull::new_unchecked(self.lock().alloc(new_layout)),
-                new_layout.size(),
-            ))
-        }
+        let slice = self.grow(ptr, old_layout, new_layout)?;
+        slice.as_non_null_ptr().as_ptr()
+            .add(old_layout.size())
+            .write_bytes(0, new_layout.size() - old_layout.size());
+        Ok(slice)
     }
 
     unsafe fn shrink(&self, ptr: NonNull<u8>, old_layout: Layout, new_layout: Layout)
     -> Result<NonNull<[u8]>, AllocError> {
-        debug_assert!(new_layout.size() <= old_layout.size());
-        
         if new_layout.size() != 0 {
+            let talloc = self.lock();
+            // SAFETY: caller guaranteed
+            let old_size = talloc.layout_to_size(old_layout);
+            let new_size = talloc.layout_to_size(new_layout);
+
+
             Ok(NonNull::slice_from_raw_parts(
-                NonNull::new_unchecked(self.lock().shrink(ptr.as_ptr(), old_layout, new_layout)),
+                NonNull::new_unchecked(
+                    self.lock().shrink(ptr.as_ptr(), old_size, new_size)
+                ),
                 new_layout.size(),
             ))
         } else {
-            self.lock().dealloc(ptr.as_ptr(), old_layout);
+            self.deallocate(ptr, old_layout);
             Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0))
         }
     }

@@ -4,51 +4,30 @@
 #![feature(ptr_metadata)]
 #![feature(alloc_error_handler)]
 
-mod bootboot;
+//mod bootboot;
 
-use core::{panic::PanicInfo, slice};
+use core::panic::PanicInfo;
  
-use amd64::{self, paging::{self, PTE}, registers::{CR3, CR0}, segmentation::{CodeSegmentDescriptor, self, SegmentSelector}};
-use libkernel::{println, out};
-use bootboot::*;
+use amd64;
+use libkernel::println;
+
+//pub static PhysMemMan: spin::Mutex<libkernel::memm::PhysMemMan> = todo!();
 
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    /// BOOTBOOT-setup framebuffer pointer
-    const FRAMEBUFFER: *const u8 = 0xfffffffffc000000 as *const _;
-    /// BOOTBOOT-setup environment string pointer
-    const ENV_CFG: *const u8 = 0xffffffffffe01000 as *const _;
-    /// BOOTBOOT payload data pointer
-    const BOOTBOOT: *const bootboot::BootBoot = 0xffffffffffe00000 as *const _;
-    /// BOOTBOOT memory map
-    const MMAP: *const bootboot::MMapEnt = BOOTBOOT.wrapping_offset(1) as *const _;
+    // ASSUME BOOTBOOT
 
 
-    if unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u16 != (*BOOTBOOT).bspid } {
-        amd64::hlt_loop();
-    }
     
     println!("KERNEL INIT");
 
 
     amd64::hlt_loop();
-    
 
     // extract data from bb structs
     // set up paging
     // stack switch(es)
-
-
-    //// SAFETY: init is never called twice, hence nor is paging_setup
-    //unsafe { paging_setup(&mut payload) };
-    //
-    //unsafe { *payload.frame_buffer_ptr.cast() = u128::MAX; }
-//
-    //unsafe { alloc_setup(&payload); } // todo
-//
-    //println!("here8");
-    amd64::hlt_loop();
 
 
     
@@ -87,7 +66,6 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 /// # Safety:
 /// Do not call twice. Assumes UEFI- & OS loader-defined handoff state.
 pub unsafe fn paging_setup() {
-    use libkernel::memm;
 
     todo!();
 

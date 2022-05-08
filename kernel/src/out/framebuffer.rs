@@ -38,7 +38,7 @@ impl FrameBufferBitmask {
 
 
 
-/// The possible pixel formats that may be used by a [`FrameBuffer`]
+/* /// The possible pixel formats that may be used by a [`FrameBuffer`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferPixelFormat {
     /// 32-bit red-green-blue-alpha 8888 pixel, bytes ordered respectively.
@@ -47,7 +47,7 @@ enum BufferPixelFormat {
     Bgra,
     /// 32-bit custom red, green, blue, alpha non-overlapping colour masks.
     Bitmask,
-}
+} */
 
 /* impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
     fn from(format: uefi::proto::console::gop::PixelFormat) -> Self {

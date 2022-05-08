@@ -1,4 +1,11 @@
-use core::{num::{NonZeroU8, NonZeroU32}, fmt::Debug};
+use core::{
+    arch::x86_64::{__cpuid, __cpuid_count},
+    num::{
+        NonZeroU8,
+        NonZeroU32
+    },
+    fmt::Debug
+};
 
 
 pub static CPUID: spin::Lazy<CpuId> = spin::Lazy::new(|| CpuId::read());
@@ -30,15 +37,21 @@ pub struct CpuId {
 impl CpuId {
     pub fn read() -> Self {
         // Safety: CPUID is supported by all AMD64 processors.
-        let (eax_std, ebx_std, ecx_std, edx_std) = unsafe { unchecked_cpuid(0, 0) };
-        // Safety: CPUID Extended Function 0x8000_0000 should give a value < 0x8000_0000 if extended functions are not supported.
-        let (eax_ext, _, _, _) = unsafe { unchecked_cpuid(0x8000_0000, 0) };
+        let std_f0 = unsafe { __cpuid(0) };
+        // Safety: eax should give a value < 0x8000_0000 if unsupported
+        let ext_f0_eax = unsafe { __cpuid(0x8000_0000).eax };
 
         Self {
-            max_std_func: eax_std,
-            max_ext_func: eax_ext,
-            // Safety: AMD64 CPUs are all little endian
-            vendor_string: unsafe { core::mem::transmute([ebx_std, edx_std, ecx_std]) },
+            max_std_func: std_f0.eax,
+            max_ext_func: ext_f0_eax,
+            // Safety: AMD64 CPUs are little endian
+            vendor_string: unsafe {
+                core::mem::transmute([
+                    std_f0.ebx,
+                    std_f0.ecx,
+                    std_f0.edx
+                ])
+            },
 
             feature_info: FeatureInfo::read(),
             monitor_info: MonitorInfo::read(),
@@ -88,65 +101,28 @@ impl Debug for CpuId {
     }
 }
 
-/// Performs the CPUID instruction, returning the contents of `(eax, ebx, ecx, edx)` thereafter respectively.
-/// 
-/// Note that some of the returned values may be undefined or reserved, refer to relevent specification for details.
-/// 
-/// ## Safety:
-/// Caller must guarantee that the provided arguments are supported by the processor, else the behaviour is
-/// specification-defined according to whatever CPU is being executed on.
-#[inline]
-pub unsafe fn unchecked_cpuid(in_eax: u32, in_ecx: u32) -> (u32, u32, u32, u32) {
-    let mut out_eax;
-    let mut out_ebx;
-    let mut out_ecx;
-    let mut out_edx;
-    
-    core::arch::asm!("
-        mov eax, {:e}
-        mov ecx, {:e}
-        cpuid            
-        mov {:e}, ebx",     // llvm reserves rbx for use; mov into another reg
-        in(reg) in_eax,
-        in(reg) in_ecx,
-        out(reg) out_ebx,
-        out("eax") out_eax,
-        out("ecx") out_ecx,
-        out("edx") out_edx,
-        options(nomem, nostack, preserves_flags)
-    );
-    
-    (out_eax, out_ebx, out_ecx, out_edx)
-}
 
-/// Performs the CPUID instruction, returning the contents of `(eax, ebx, ecx, edx)` thereafter respectively.
+/// Performs the CPUID instruction, returning the contents of
+/// `(eax, ebx, ecx, edx)` thereafter respectively.
 /// 
-/// Note that some of the returned values may be undefined or reserved, refer to relevent specification for details.
+/// Note that some of the returned values may be undefined or
+/// reserved, refer to relevent specification for details.
 /// 
-/// Returns `None` where the CPU explicitly does not support the function. Determination thereof is done through
-/// comparing the output in EAX after flooring to a multiple of 0x4000_0000 to `in_eax`. 
+/// Returns `None` where the CPU explicitly does not support the function. 
+/// Determination thereof is done through  comparing the output in EAX after 
+/// flooring to a multiple of 0x4000_0000 to `in_eax`. 
 pub fn cpuid(in_eax: u32, in_ecx: u32) -> Option<(u32, u32, u32, u32)> {
-    // Automatically masks to:
-    // 0x0 (standard), 0x4000_0000 (hypervisor), 0x8000_0000 (extended), and 0xC000_0000 (reserved)
-    let eax_floored = in_eax & 0xC000_0000;
-    let mut max_func: u32;
-    
-    // Safety: outputs should be zero or below eax_floored where the given cpuid is not supported?
-    unsafe {
-        core::arch::asm!("
-            mov eax, {:e}
-            cpuid",
-            in(reg) eax_floored,
-            out("eax") max_func,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    if in_eax > max_func {
+    // Masks to:
+    // 0x0         (standard),
+    // 0x4000_0000 (hypervisor),
+    // 0x8000_0000 (extended),
+    // 0xC000_0000 (reserved)
+    if in_eax > unsafe { __cpuid(in_eax & 0xC000_0000) }.eax {
         None
     } else {
         // Safety: confirmed that this CPU supports the in_eax function
-        Some(unsafe { unchecked_cpuid(in_eax, in_ecx) })
+        let result = unsafe { __cpuid_count(in_eax, in_ecx) };
+        Some((result.eax, result.ebx, result.ecx, result.edx))
     }
 }
 
@@ -183,6 +159,8 @@ bitflags::bitflags! {
         const SSE41 = 1 << 19;
         /// SSE4.2 instruction support.
         const SSE42 = 1 << 20;
+        /// x2Apic support.
+        const X2APIC = 1 << 21;
         /// MOVBE instruction support.
         const MOVBE = 1 << 22;
         /// POPCNT instruction support.
@@ -1342,35 +1320,4 @@ impl IbsInfo {
     }
 }
 
-bitflags::bitflags! {
-    /// CPUID Extended Function 0x8000_001B - EAX return value: IBS Feature Identifiers.
-    pub struct ExtFn1CEAX: u32 {
-        
-    }
-}
-/// Lightweight Profiling Capabilities. Return data of CPUID function 0x8000_001C.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LwpCapabilities {
-    
-}
-impl LwpCapabilities {
-    /// Performs CPUID function 0x8000_001C, if supported, and returns the rendered data.
-    pub fn read() -> Option<Self> {
-        return None;
-
-        todo!();
-
-        if !ExtFeatureInfo::test_ecx_flags(ExtFn1ECX::LWP) {
-            return None;
-        }
-
-        let (eax, _, _, _) = cpuid(0x8000_001C, 0)?;
-
-        Some(
-            Self {
-                
-            }
-        )
-    }
-}
 

@@ -1,34 +1,33 @@
 
-pub const PT_LADDR_INDEX_MASK: u64   = 0o000000_000_000_000_777_0000;
-pub const PD_LADDR_INDEX_MASK: u64   = 0o000000_000_000_777_000_0000;
-pub const PDPT_LADDR_INDEX_MASK: u64 = 0o000000_000_777_000_000_0000;
-pub const PML4_LADDR_INDEX_MASK: u64 = 0o000000_777_000_000_000_0000;
+pub const PT_IDX_MASK: isize   = 0o000000_000_000_000_777_0000;
+pub const PD_IDX_MASK: isize   = 0o000000_000_000_777_000_0000;
+pub const PDPT_IDX_MASK: isize = 0o000000_000_777_000_000_0000;
+pub const PML4_IDX_MASK: isize = 0o000000_777_000_000_000_0000;
 
 /// The address below which linear addresses in the subset of 
 /// the 64-bit address space scheme are canonical.
-pub const CANONICAL_LOWER_HALF: u64   = 0o000000_400_000_000_000_0000;
+pub const LOWER_HALF: isize  = 0o000000_400_000_000_000_0000;
 /// The address at and above which linear addresses in the 48-bit subset of 
 /// the 64-bit address space are canonical.
-pub const CANONICAL_HIGHER_HALF: u64  = 0o177777_400_000_000_000_0000;
+pub const HIGHER_HALF: isize = -LOWER_HALF;
 
 
-/// 4 KiB
-pub const PAGE_TABLE_SIZE: u64   = 0x1000;
-/// 4 KiB
-pub const PTE_MAPPED_SIZE: u64   = 0x1000;
-/// 2 MiB
-pub const PDE_MAPPED_SIZE: u64   = 0x200000;
-/// 1 GiB
-pub const PDPTE_MAPPED_SIZE: u64 = 0x40000000;
-/// 512 GiB
-pub const PML4E_MAPPED_SIZE: u64 = 0x8000000000;
+/// 4 KiB: Page Table entry mapped size.
+pub const PTE_SIZE: usize   = 0x1000;
+/// 2 MiB: Page Directory entry mapped size.
+pub const PDE_SIZE: usize   = 0x200000;
+/// 1 GiB: Page Directory Pointer Table entry mapped size.
+pub const PDPTE_SIZE: usize = 0x40000000;
+/// 512 GiB: Page Map Level 4 entry mapped size.
+pub const PML4E_SIZE: usize = 0x8000000000;
 
 /// Sizes of long-mode pages in bytes.
-#[repr(u64)]
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PageSize {
-    PTE4KiB   = PTE_MAPPED_SIZE,
-    PDE2MiB   = PDE_MAPPED_SIZE,
-    PDPTE1GiB = PDPTE_MAPPED_SIZE,
+    PTE4KiB   = PTE_SIZE,
+    PDE2MiB   = PDE_SIZE,
+    PDPTE1GiB = PDPTE_SIZE,
 }
 
 
@@ -40,7 +39,7 @@ pub const PML4_LEVEL: usize = 4;
 bitflags::bitflags! {
     /// Page Table Entry flags. 
     /// Generic over all long mode page tables, see flag documentation for details.
-    pub struct PTE: u64 {
+    pub struct PTE: usize {
         /// P: When set, determines that the physical page base specified is 
         /// loaded in physical memory. When clear, the rest of the entry becomes 
         /// available for software use.
@@ -131,7 +130,7 @@ impl PTE {
     /// # Panics
     /// Panics if paddr is not page-aligned or is too large for AMD64 architecture.
     #[inline]
-    pub const fn from_paddr(paddr: u64) -> PTE {
+    pub const fn from_paddr(paddr: usize) -> PTE {
         assert!(paddr & !PTE::BASE_MASK.bits == 0, 
             "addr is not page-aligned or is too large for AMD64 architecture");
 
@@ -141,7 +140,7 @@ impl PTE {
     }
 
     #[inline]
-    pub const fn get_paddr(&self) -> u64 {
+    pub const fn get_paddr(&self) -> usize {
         self.bits & PTE::BASE_MASK.bits
     }
 }
@@ -152,23 +151,28 @@ impl PTE {
 /// Return the size of the virtual memory that a given page table entry spans, 
 /// where a PDPT entry is `level` 3, a PDT is entry `level` 2, and so on.
 #[inline]
-pub const fn page_size(lvl: usize) -> u64 {
-    (lvl as u64 - 1) * 0o1000 * 0o10000
+pub const fn page_size(lvl: usize) -> usize {
+    (lvl - 1) * 0o1000 * 0o10000
 }
 
 /// Extract the index into the given level of page table, where the index into 
 /// the PML4T is `level` 4, the index into the PDPT is `level` 3, and so on.
 #[inline]
-pub const fn table_index(laddr: u64, lvl: usize) -> usize {
-    (laddr >> lvl * 9 + 3 & 0o777) as usize
+pub fn table_index<T>(laddr: *mut T, lvl: usize) -> usize {
+    ((laddr as isize >> lvl * 9 + 3) & 0o777) as usize
 }
 
 /// The returned linear address will address into a guest page table hierarchy.
 /// 
 /// Note that `laddr` is expected to be recursive to some degree.
 #[inline]
-pub const fn guest_pml4(laddr: u64, guest_idx: u64) -> u64 {
-    laddr & !PML4_LADDR_INDEX_MASK | guest_idx
+pub fn set_pml4_idx<T>(laddr: *mut T, guest_idx: usize) -> *mut T {
+    (laddr as isize
+    & !PML4_IDX_MASK
+    | ((guest_idx as isize)
+        << PML4_IDX_MASK.trailing_zeros()
+        & PML4_IDX_MASK
+    )) as *mut _
 }
 
 
@@ -176,37 +180,40 @@ pub const fn guest_pml4(laddr: u64, guest_idx: u64) -> u64 {
 
 /// Returns the linear address of the Page Table entry `laddr` is translated by.
 #[inline]
-pub const fn recur_to_pte(laddr: u64, recursive_idx: u64) -> u64 {
-    // The rust compiler, given a const recursive_idx, compiles recursive 
+pub fn recur_to_pte<T>(laddr: *mut T, rcrsv_idx: usize) -> *mut PTE {
+    // The rust compiler, given a const rcrsv_idx, compiles recursive 
     // calls to this function into about 4 instructions.
 
     // Shift the linear address down such that the address indexes the page 
     // tables after the pml4 recursion.
-    laddr >> 9 
+    (laddr as isize >> 9 
     // Mask out the sign extention, PML4 index, and lower 3 bits
-    & !(CANONICAL_HIGHER_HALF | PML4_LADDR_INDEX_MASK | 7) 
+    & !(HIGHER_HALF | PML4_IDX_MASK | 7) 
     // OR in the sign extended recursive entry index 
-    | ((recursive_idx << 55) as i64 >> 16) as u64
+    | ((rcrsv_idx << 55) as isize >> 16)) as *mut _
 }
 /// Returns the linear address of the Page Directory entry `laddr` is translated by.
 #[inline]
-pub const fn recur_to_pde(laddr: u64, recursive_idx: u64) -> u64 {
-    recur_to_pte(recur_to_pte(laddr, recursive_idx), recursive_idx)
+pub fn recur_to_pde<T>(laddr: *mut T, rcrsv_idx: usize) -> *mut PTE {
+    recur_to_pte(recur_to_pte(laddr, rcrsv_idx), rcrsv_idx)
 }
 /// Returns the linear address of the PDPT entry `laddr` is translated by.
 #[inline]
-pub const fn recur_to_pdpte(laddr: u64, recursive_idx: u64) -> u64 {
-    recur_to_pde(recur_to_pte(laddr, recursive_idx), recursive_idx)
+pub fn recur_to_pdpte<T>(laddr: *mut T, rcrsv_idx: usize) -> *mut PTE {
+    recur_to_pde(recur_to_pte(laddr, rcrsv_idx), rcrsv_idx)
 }
 /// Returns the linear address of the PML4 entry `laddr` is translated by.
 #[inline]
-pub const fn recur_to_pml4e(laddr: u64, recursive_idx: u64) -> u64 {
-    recur_to_pdpte(recur_to_pte(laddr, recursive_idx), recursive_idx)
+pub fn recur_to_pml4e<T>(laddr: *mut T, rcrsv_idx: usize) -> *mut PTE {
+    recur_to_pdpte(recur_to_pte(laddr, rcrsv_idx), rcrsv_idx)
 }
 
-/// Returns the linear address of the base of the page/table `laddr` addresses.
+/// Returns the page table containing the given entry.
 #[inline]
-pub const fn table_of_entry(laddr: u64) -> u64 {
-    laddr & !0o7777
+pub fn table_of_entry(laddr: *mut PTE) -> *mut [PTE] {
+    core::ptr::slice_from_raw_parts_mut(
+        <*mut PTE>::from_bits(laddr.to_bits() & !0o7777), 
+        512
+    )
 }
 

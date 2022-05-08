@@ -17,19 +17,23 @@ SECTIONS {
     . = 0xffffffffc0000000;
     . += 0x10000;
 
-	.text ALIGN(0x1000) : { 
+	.text : ALIGN(0x1000) { 
         *(.text .text.*);
         *(.rodata .rodata.*);
         *(.data .data.*);
     } : load
 
-    . = ALIGN(16);
-
-    .bss (NOLOAD) : {
+    .bss (NOLOAD) : ALIGN(0x1000) {
         *(.bss .bss.*);
     } : load
 
+    .stack_sizes (INFO) : {
+        KEEP(*(.stack_sizes));
+    }
+
     /DISCARD/ : {
-		*(.eh_frame .note.GNU-stack);
+		*(.eh_frame .eh_frame.*);
+        *(.eh_frame_hdr .eh_frame_hdr.*);
+        *(.note.GNU-stack);
 	}
 }

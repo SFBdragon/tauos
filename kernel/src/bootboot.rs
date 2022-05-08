@@ -15,12 +15,17 @@ pub const FB_RGBA: u8 = 1;
 pub const FB_ABGR: u8 = 2;
 pub const FB_BGRA: u8 = 3;
 
+pub const MMAP_DATA_SIZE_MASK: u64 = 0xfffffffffffffff0;
+pub const MMAP_DATA_TYPE_MASK: u64 = 0xf;
 pub const MMAP_USED: u64 = 0;
 pub const MMAP_FREE: u64 = 1;
 pub const MMAP_ACPI: u64 = 2;
 pub const MMAP_MMIO: u64 = 3;
 
-pub const INITRD_MAXSIZE: u32 = 16;
+pub const FRAMEBUFFER: *const u8 = 0xfffffffffc000000 as *const _;
+pub const ENV_CFG: *const u8 = 0xffffffffffe01000 as *const _;
+pub const BOOTBOOT: *const BootBoot = 0xffffffffffe00000 as *const _;
+pub const MMAP: *const MMapEntry = BOOTBOOT.wrapping_offset(1) as *const _;
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
@@ -44,14 +49,14 @@ pub struct BootBoot {
     #[cfg(target_arch = "x86_64")]
     pub platform: BootBootAmd64,
 
-    pub mmap: MMapEnt,
+    pub mmap: MMapEntry,
 }
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
-pub struct MMapEnt {
+pub struct MMapEntry {
     pub ptr: u64,
-    pub size: u64,
+    pub data: u64,
 }
 
 #[repr(C, packed)]

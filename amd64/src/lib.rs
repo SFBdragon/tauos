@@ -6,6 +6,8 @@
 //! redundant, less thoroughly documented, and untested code.
 
 #![no_std]
+
+#![feature(ptr_to_from_bits)]
 #![feature(abi_x86_interrupt)]
 
 pub mod registers;
@@ -13,7 +15,6 @@ pub mod interrupts;
 pub mod segmentation;
 pub mod paging;
 pub mod ports;
-pub mod cpuid;
 
 
 

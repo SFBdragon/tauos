@@ -1,5 +1,30 @@
+use core::intrinsics::assume;
+
 
 pub mod llist;
+
+
+/// ### Safety:
+/// `val` must be nonzero
+#[inline]
+pub const unsafe fn fast_non0_log2(val: usize) -> usize {
+    assume(val != 0);
+    usize::BITS as usize - 1 ^ val.leading_zeros() as usize
+}
+/// ### Safety:
+/// `val` must be nonzero
+#[inline]
+pub const unsafe fn fast_non0_prev_pow2(val: usize) -> usize {
+    assume(val != 0);
+    1 << fast_non0_log2(val as usize)
+}
+/// ### Safety:
+/// `val` must be nonzero 
+#[inline]
+pub const unsafe fn fast_non0_next_pow2(val: usize) -> usize {
+    assume(val != 0);
+    1 << u64::BITS - (val - 1).leading_zeros() 
+}
 
 
 /// Copy bits from `src` `src_base..src_acme` into `dst` `dst_base..dst_acme`,
