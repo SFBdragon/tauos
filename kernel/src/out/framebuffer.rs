@@ -36,8 +36,6 @@ impl FrameBufferBitmask {
     };
 }
 
-
-
 /* /// The possible pixel formats that may be used by a [`FrameBuffer`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferPixelFormat {
@@ -121,7 +119,7 @@ impl<'a> FrameBuffer<'a> {
 
 
 
-// --------------- PIXEL FORMAT CONVERSIONS ----------------
+// --------------- PIXEL FORMAT CONVERSIONS ---------------- //
 
 
 /// Convert pixel format bidirectionally between RGBA8888 and BGRA8888.

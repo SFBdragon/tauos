@@ -11,8 +11,7 @@
 #![feature(slice_ptr_len)]
 #![feature(slice_ptr_get)]
 
-
-//extern crate alloc;
+extern crate alloc;
 
 pub mod memm;
 pub mod out;

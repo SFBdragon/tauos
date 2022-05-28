@@ -7,12 +7,12 @@ use core::{marker::PhantomData, fmt};
 /// Writing to random I/O ports can harm the system. 
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
-pub unsafe fn outb(port: u16, data: u8) {
+pub unsafe fn out8(port: u16, data: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
-pub unsafe fn inb(port: u16) -> u8 {
+pub unsafe fn in8(port: u16) -> u8 {
     let value: u8;
     core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
@@ -21,12 +21,12 @@ pub unsafe fn inb(port: u16) -> u8 {
 /// Writing to random I/O ports can harm the system. 
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
-pub unsafe fn outs(port: u16, data: u16) {
+pub unsafe fn out16(port: u16, data: u16) {
     core::arch::asm!("out dx, ax", in("dx") port, in("ax") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
-pub unsafe fn ins(port: u16) -> u16 {
+pub unsafe fn in16(port: u16) -> u16 {
     let value: u16;
     core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
@@ -35,12 +35,12 @@ pub unsafe fn ins(port: u16) -> u16 {
 /// Writing to random I/O ports can harm the system. 
 /// Caller must ensure that the port is valid and available.
 /// Caller must ensure not to write to reserved data.
-pub unsafe fn outi(port: u16, data: u32) {
+pub unsafe fn out32(port: u16, data: u32) {
     core::arch::asm!("out dx, eax", in("dx") port, in("eax") data, options(nomem, nostack, preserves_flags));
 }
 /// # Safety:
 /// Caller must ensure that the port is valid.
-pub unsafe fn ini(port: u16) -> u32 {
+pub unsafe fn in32(port: u16) -> u32 {
     let value: u32;
     core::arch::asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
     value
@@ -75,39 +75,39 @@ pub trait PortData {
 impl PortData for u8 {
     #[inline]
     unsafe fn port_read(port: u16, mask: Self) -> (Self, Self) {
-        let value = inb(port);
+        let value = in8(port);
         (value & mask, value & !mask)
     }
 
     #[inline]
     unsafe fn port_write(port: u16, data: Self, mask: Self) -> Self {
-        outb(port, data & mask);
+        out8(port, data & mask);
         data & !mask
     }
 }
 impl PortData for u16 {
     #[inline]
     unsafe fn port_read(port: u16, mask: Self) -> (Self, Self) {
-        let value = ins(port);
+        let value = in16(port);
         (value & mask, value & !mask)
     }
 
     #[inline]
     unsafe fn port_write(port: u16, data: Self, mask: Self) -> Self {
-        outs(port, data & mask);
+        out16(port, data & mask);
         data & !mask
     }
 }
 impl PortData for u32 {
     #[inline]
     unsafe fn port_read(port: u16, mask: Self) -> (Self, Self) {
-        let value = ini(port);
+        let value = in32(port);
         (value & mask, value & !mask)
     }
 
     #[inline]
     unsafe fn port_write(port: u16, data: Self, mask: Self) -> Self {
-        outi(port, data & mask);
+        out32(port, data & mask);
         data & !mask
     }
 }
@@ -133,11 +133,10 @@ impl PortWriteAccessTrait for ReadWritePortAccess { }
 /// * `Port<T>` = `IoPort<T, ReadWritePortAccess>`
 /// * `ReadOnlyPort<T>` = `IoPort<T, ReadOnlyPortAccess>`
 /// * `WriteOnlyPort<T>` = `IoPort<T, WriteOnlyPortAccess>`
-pub struct IoPort<T, RW>
-where T : Sized {
-    port: u16,
-    mask: T,
-    phantom: PhantomData<(T, RW)>,
+pub struct IoPort<T: Sized, RW> {
+    pub port: u16,
+    pub mask: T,
+    phantom: PhantomData<RW>,
 }
 
 /// A read/write data width-generic I/O port
@@ -158,24 +157,20 @@ impl<T : Sized, RW> IoPort<T, RW> {
     /// `mask` can be used to protect reserved bits, but cannot be used to guarantee valid writes
     /// for all I/O registers even if correctly configured, thus write access remains `unsafe` regardless.
     pub const unsafe fn new(port: u16, mask: T) -> Self {
-        Self {
-            port,
-            mask,
-            phantom: PhantomData
-        }
+        Self { port, mask, phantom: PhantomData }
     }
 }
 
-impl<T : PortData + Copy, RW : PortWriteAccessTrait> IoPort<T, RW> {
+impl<T : PortData + Clone, RW : PortWriteAccessTrait> IoPort<T, RW> {
     /// Reads data from the I/O port into first returned value,
     /// masking out bits as per `mask` into second returned value.
     pub fn read(&mut self) -> (T, T) {
         unsafe {
-            T::port_read(self.port, self.mask)
+            T::port_read(self.port, self.mask.clone())
         }
     }
 }
-impl<T : PortData + Copy, RW : PortWriteAccessTrait> IoPort<T, RW> {
+impl<T : PortData + Clone, RW : PortWriteAccessTrait> IoPort<T, RW> {
     /// Writes data to the I/O port, masking out bits from `data` per internal mask into returned value.
     /// 
     /// # Safety:
@@ -185,7 +180,7 @@ impl<T : PortData + Copy, RW : PortWriteAccessTrait> IoPort<T, RW> {
     /// 
     /// Ensure the data being written complies to the port's specification.
     pub unsafe fn write(&mut self, data: T) -> T {
-        T::port_write(self.port, data, self.mask)
+        T::port_write(self.port, data, self.mask.clone())
     }
 }
 
@@ -193,16 +188,16 @@ impl<T, RW> fmt::Debug for IoPort<T, RW> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IoPort")
             .field("port", &self.port)
-            .field("byte(s)", &core::mem::size_of::<T>())
+            .field("width in bytes", &core::mem::size_of::<T>())
             .finish()
     }
 }
 
-impl<T: Copy, RW> Clone for IoPort<T, RW> {
+impl<T: Clone, RW> Clone for IoPort<T, RW> {
     fn clone(&self) -> Self {
         Self {
             port: self.port,
-            mask: self.mask,
+            mask: self.mask.clone(),
             phantom: PhantomData,
         }
     }

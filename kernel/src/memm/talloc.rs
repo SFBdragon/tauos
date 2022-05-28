@@ -1,7 +1,6 @@
 use core::{
     ptr::{self, NonNull},
     alloc::{GlobalAlloc, Layout, Allocator, AllocError},
-    fmt::Debug,
     intrinsics::assume, ops::Range,
 };
 use crate::utils::{self, llist::LlistNode};
@@ -83,6 +82,9 @@ pub struct Talloc {
     bitmap: *mut [u8],
 }
 
+unsafe impl Send for Talloc {}
+unsafe impl Sync for Talloc {}
+
 impl Talloc {
     /// Returns the corresponding granularity for a given block size.
     #[inline]
@@ -100,8 +102,7 @@ impl Talloc {
         // arena_size_pow2 >> (log2(block_size) + 1), plus,
         // block_size - (arena_base &!(size - 1)) >> (log2(block_size) + 1)
         // (Precalculating `arena_size_pow2`, approximately halves generated assembly.)
-        (
-            self.arena_size_pow2 + 
+        (   self.arena_size_pow2 + 
             (base as isize - (self.arena_base & !(size as isize-1))) as usize
         ) >> utils::fast_non0_log2(size)+1
     }
@@ -261,12 +262,14 @@ impl Talloc {
     /// * The arena may wrap around the address space.
     pub fn new(arena_base: *mut u8, arena_size: usize, smallest_block: usize,
     llists: *mut [LlistNode<()>], bitmap: *mut [u8]) -> Self {
-        // verify arena validity
-        Self::validate_arena_args(arena_size, smallest_block);
-        // verify slice lengths' validity
-        let slice_lengths = Self::slice_lengths(arena_size, smallest_block);
-        assert_eq!(slice_lengths.0, llists.len());
-        assert_eq!(slice_lengths.1, bitmap.len());
+        {
+            // verify arena validity
+            Self::validate_arena_args(arena_size, smallest_block);
+            // verify slice lengths' validity
+            let (llists_len, bitmap_len) = Self::slice_lengths(arena_size, smallest_block);
+            assert_eq!(llists_len, llists.len());
+            assert_eq!(bitmap_len, bitmap.len());
+        }
 
         // initialize slices
         unsafe {
@@ -279,8 +282,8 @@ impl Talloc {
         let arena_size_pow2 = (arena_size as usize).next_power_of_two();
         Self {
             arena_base: arena_base as isize,
-            arena_size: arena_size,
-            arena_size_pow2: arena_size_pow2,
+            arena_size,
+            arena_size_pow2,
             arena_size_pow2_lzcnt: arena_size_pow2.leading_zeros(),
             smlst_block: smallest_block,
             avails: 0,
@@ -289,6 +292,25 @@ impl Talloc {
         }
     }
 
+    /// Returns an invalid `Talloc`.
+    /// This can be useful for initializing static, mutable variables.
+    /// 
+    /// Alternatively consider using `Talloc::new(...)`.
+    /// ### Safety: 
+    /// Do not access/set fields or call any methods on the result hereof.
+    /// This instance comes with no guarantees other than being move-able.
+    pub const unsafe fn new_invalid() -> Self {
+        Self {
+            arena_base: 0,
+            arena_size_pow2: 0,
+            arena_size_pow2_lzcnt: 0,
+            arena_size: 0,
+            smlst_block: 0,
+            avails: 0,
+            llists: NonNull::<[_; 0]>::dangling().as_ptr(),
+            bitmap: NonNull::<[_; 0]>::dangling().as_ptr(),
+        }
+    }
 
 
     /// Returns a closed range describing the span of memory conservatively 
@@ -483,6 +505,9 @@ impl Talloc {
     }
 
     
+    // todo: arena grow/shrink functions?
+
+    
     /// Allocate memory. 
     /// 
     /// Allocations are guaranteed to be a power of two in size, size-aligned,
@@ -505,14 +530,15 @@ impl Talloc {
             return Ok(self.remove_block_next(granularity, size) as *mut u8);
         }
 
-        // find a larger block to break apart:
+        // find a larger block (smaller granularity) to break apart:
         let larger_avl = self.avails & !(usize::MAX << granularity);
         if larger_avl == 0 { return Err(AllocError); } // not enough memory
         
         let lgr_granularity = utils::fast_non0_log2(larger_avl);
         let lgr_size = self.arena_size_pow2 >> lgr_granularity;
         let lgr_base = self.remove_block_next(lgr_granularity, lgr_size);
-
+        
+        
         // break down the large block into smaller blocks
         let mut hi_block_size = lgr_size >> 1;
         for hi_granularity in (lgr_granularity + 1)..=granularity {
@@ -687,22 +713,33 @@ pub struct Tallock(spin::Mutex<Talloc>);
 
 impl Tallock {
     /// Returns an invalid `Tallock`. This can be useful for initializing 
-    /// static, mutable variables.
+    /// static variables. Use `new_valid` to replace the inner `Talloc` with
+    /// a valid instance through a shared reference.
     /// 
     /// Alternatively consider using `Tallock::new(...)`.
     /// ### Safety: 
-    /// It is undefined behaviour to access fields/call any methods on the result hereof.
+    /// Do not access/set fields or call any methods on the result hereof.
     pub const unsafe fn new_invalid() -> Self {
-        Self(Mutex::new(Talloc {
-            arena_base: 0,
-            arena_size_pow2: 0,
-            arena_size_pow2_lzcnt: 0,
-            arena_size: 0,
-            smlst_block: 0,
-            avails: 0,
-            llists: NonNull::<[_; 0]>::dangling().as_ptr(),
-            bitmap: NonNull::<[_; 0]>::dangling().as_ptr(),
-        }))
+        Self(Mutex::new(Talloc::new_invalid()))
+    }
+    /// Set an invalid `Tallock` to a valid configuration.
+    /// Access the inner `Talloc` via `.lock()`.
+    /// ### Arguments:
+    /// * `llists`'s and `bitmap`'s lengths should equal `Talloc::slice_lengths`'s values.
+    /// * `16 <= smallest_block`
+    /// * `0 < arena_size <= MAXIMUM_ARENA_SIZE`
+    /// * The arena may wrap around the address space.
+    /// ### Safety:
+    /// Invoke this function **only** on *invalid* `Tallock`s.
+    pub unsafe fn new_valid(&self, arena_base: *mut u8, arena_size: usize,
+    smallest_block: usize, llists: *mut [LlistNode<()>], bitmap: *mut [u8]) {
+        *self.0.lock() = Talloc::new(
+            arena_base, 
+            arena_size, 
+            smallest_block, 
+            llists, 
+            bitmap,
+        );
     }
 
     /// Create a new `Tallock`. Access the inner `Talloc` via `.lock()`.

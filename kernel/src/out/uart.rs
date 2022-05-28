@@ -9,7 +9,7 @@
 
 use core::fmt::Write;
 use spin::{Lazy, Mutex};
-use amd64::ports::{ReadOnlyPort, WriteOnlyPort, Port, PortData, outb, inb};
+use amd64::ports::{ReadOnlyPort, WriteOnlyPort, Port, PortData, out8, in8};
 
 
 // standard x86_64 port-mapped UART devices
@@ -18,24 +18,28 @@ pub const COM2: u16 = 0x2f8;
 pub const COM3: u16 = 0x3e8;
 pub const COM4: u16 = 0x2e8;
 
-#[allow(dead_code)]
 pub static UART_COM1: Lazy<(Mutex<UartPort>, UartChipVersion)> = Lazy::new(|| {
-    let (port, ver) = unsafe { UartPort::new(COM1) }.expect("UART COM1 initialization failed!");
+    let (port, ver) = unsafe { 
+        UartPort::new(COM1) 
+    }.expect("UART COM1 initialization failed!");
     (Mutex::new(port), ver)
 });
-#[allow(dead_code)]
 pub static UART_COM2: Lazy<(Mutex<UartPort>, UartChipVersion)> = Lazy::new(|| {
-    let (port, ver) = unsafe { UartPort::new(COM2) }.expect("UART COM2 initialization failed!");
+    let (port, ver) = unsafe { 
+        UartPort::new(COM2) 
+    }.expect("UART COM2 initialization failed!");
     (Mutex::new(port), ver)
 });
-#[allow(dead_code)]
 pub static UART_COM3: Lazy<(Mutex<UartPort>, UartChipVersion)> = Lazy::new(|| {
-    let (port, ver) = unsafe { UartPort::new(COM3) }.expect("UART COM3 initialization failed!");
+    let (port, ver) = unsafe { 
+        UartPort::new(COM3) 
+    }.expect("UART COM3 initialization failed!");
     (Mutex::new(port), ver)
 });
-#[allow(dead_code)]
 pub static UART_COM4: Lazy<(Mutex<UartPort>, UartChipVersion)> = Lazy::new(|| {
-    let (port, ver) = unsafe { UartPort::new(COM4) }.expect("UART COM4 initialization failed!");
+    let (port, ver) = unsafe {
+        UartPort::new(COM4)
+    }.expect("UART COM4 initialization failed!");
     (Mutex::new(port), ver)
 });
 
@@ -336,8 +340,8 @@ impl_u8_portdata_for_bitflags!(MSR);
 unsafe fn identify_uart(port: u16) -> UartChipVersion {
     // https://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming#Software_Identification_of_the_UART
 
-    outb(port + FCR_OFFSET, 0xE7);
-    let iir = inb(port + IIR_OFFSET);
+    out8(port + FCR_OFFSET, 0xE7);
+    let iir = in8(port + IIR_OFFSET);
     if iir & (1 << 6) != 0 {
         if iir & (1 << 7) != 0 {
             if iir & (1 << 5) != 0 {
@@ -349,8 +353,8 @@ unsafe fn identify_uart(port: u16) -> UartChipVersion {
             UartChipVersion::V16550
         }
     } else {
-        outb(port + SCR_OFFSET, 0x2A);
-        let scr = inb(port + SCR_OFFSET);
+        out8(port + SCR_OFFSET, 0x2A);
+        let scr = in8(port + SCR_OFFSET);
         if scr == 0x2A {
             UartChipVersion::V16450
         } else {
@@ -368,7 +372,7 @@ unsafe fn identify_uart(port: u16) -> UartChipVersion {
 /// Checking these return values are not required, but may be helpful for ensuring your code 
 /// is configuring the UART as expected.
 pub struct UartPort {
-    // port_addr: u16,
+    //port_addr: u16,
 
     /// Transmission Holding Buffer register
     pub thbr: WriteOnlyPort<u8>,
@@ -412,7 +416,7 @@ impl UartPort {
     pub unsafe fn new(port_addr: u16) -> Result<(Self, UartChipVersion), &'static str> {
         // get UART version
         let ver = identify_uart(port_addr);
-
+        
         // configure port masks for version
 
         let ier_mask = if ver >= UartChipVersion::V16750 {
@@ -442,7 +446,7 @@ impl UartPort {
         };
 
         let mut uart = UartPort { 
-            // port_addr,
+            //port_addr,
 
             thbr: WriteOnlyPort::new(port_addr + THBR_OFFSET, u8::MAX),
             rbr: ReadOnlyPort::new(port_addr + RBR_OFFSET, u8::MAX),
@@ -469,21 +473,29 @@ impl UartPort {
 
     pub fn reset_to_default(&mut self) {
         unsafe {
-            self.set_baud_rate(BaudRate::BR57600);
-
             self.ier.write(IER::empty()); // Disable all interrupts
+            self.set_baud_rate(BaudRate::BR115200);
+
             self.lcr.write(LCR::WORD_LENGTH_8_BITS | LCR::NO_PARITY);
-            self.mcr.write(MCR::DATA_TERMINAL_READY | MCR::REQUEST_TO_SEND | MCR::AUXILLARY_OUTPUT_1
-                | MCR::AUXILLARY_OUTPUT_2);
-            self.fcr.write(FCR::ENABLE_FIFOS | FCR::CLEAR_RECEIVE_FIFO | FCR::CLEAR_TRANSMIT_FIFO 
-                | FCR::ENABLE_64_BYTE_FIFO | FCR::INTERRUPT_TRIGGER_LEVEL_1_1);
+            self.fcr.write(FCR::ENABLE_FIFOS
+                | FCR::CLEAR_RECEIVE_FIFO
+                | FCR::CLEAR_TRANSMIT_FIFO 
+                | FCR::ENABLE_64_BYTE_FIFO
+                | FCR::INTERRUPT_TRIGGER_LEVEL_8_32 // todo change back to 1 1?
+            );
+            self.mcr.write(MCR::DATA_TERMINAL_READY 
+                | MCR::REQUEST_TO_SEND
+                | MCR::AUXILLARY_OUTPUT_1 
+                | MCR::AUXILLARY_OUTPUT_2
+            );
         }
     }
 
     fn test(&mut self) -> Result<(), &'static str> {
         unsafe {
             let mcr = self.mcr.read().0;
-            self.mcr.write(mcr | MCR::LOOPBACK_ENABLED); // ensure loopback mode enable
+            // enable loopback mode
+            self.mcr.write(mcr | MCR::LOOPBACK_ENABLED);
 
             // test if byte sent equals byte received
             self.rbr.write(0x2B);
@@ -491,7 +503,8 @@ impl UartPort {
                 return Result::Err("Port R/W test failed!");
             }
 
-            self.mcr.write(mcr); // reset mcr to original value
+            // reset mcr to original value
+            self.mcr.write(mcr);
             Result::Ok(())
         }
     }
@@ -539,13 +552,5 @@ impl Write for UartPort {
         }
 
         core::fmt::Result::Ok(())
-    }
-
-    fn write_char(&mut self, c: char) -> core::fmt::Result {
-        self.write_str(c.encode_utf8(&mut [0; 4]))
-    }
-
-    fn write_fmt(mut self: &mut Self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
-        core::fmt::write(&mut self, args)
     }
 }

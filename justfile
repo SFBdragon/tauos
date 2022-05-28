@@ -2,8 +2,8 @@
 # written to run on wsl, with qemu installed on windows
 # if you're on linux change qemu-system-x86_64.exe -> qemu-system-x86_64
 
-arch          := 'x86_64'
-config        := 'debug'
+arch            := 'x86_64'
+config          := 'debug'
 
 wrk_dir         := justfile_directory()
 
@@ -31,10 +31,10 @@ knl_out_exe     := join(knl_build_dir, knl_tgt, config, 'kernel')
 
 
 dev_dir         := join(wrk_dir, 'dev')
-mkbootimg := join(dev_dir, 'mkbootimg.exe')
+mkbootimg       := join(dev_dir, 'mkbootimg.exe')
 
-ovmf_code := join(dev_dir, 'OVMF_CODE-pure-efi.fd')
-ovmf_vars := join(dev_dir, 'OVMF_VARS-pure-efi.fd')
+ovmf_code       := join(dev_dir, 'OVMF_CODE-pure-efi.fd')
+ovmf_vars       := join(dev_dir, 'OVMF_VARS-pure-efi.fd')
 
 
 cargo_bld_std   := '-Z build-std-features=compiler-builtins-mem -Z build-std=core,compiler_builtins,alloc'
@@ -47,7 +47,7 @@ check profile='dev':
 build profile='dev':
     cargo +nightly build --profile {{profile}} {{cargo_knl_bld}}
     
-    strip --strip-all -K mmio -K fb -K bootboot -K environment -K initstack {{knl_out_exe}}
+    #strip --strip-all -K mmio -K fb -K bootboot -K environment -K initstack {{knl_out_exe}}
 
     @# tsp setup
     rm -r -f {{tsp_dir}}
@@ -62,6 +62,7 @@ build profile='dev':
     @# create the disk image
     ./dev/mkbootimg diskcfg.json {{join(tgt_dir, 'disk.img')}}
 
+    @echo ''
 
 run profile='dev': (build profile)
     qemu-system-x86_64.exe -nodefaults -vga std -serial stdio -no-reboot \

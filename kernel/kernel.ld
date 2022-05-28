@@ -6,7 +6,7 @@ mmio        = 0xfffffffff8000000;
 fb          = 0xfffffffffc000000;
 bootboot    = 0xffffffffffe00000;
 environment = 0xffffffffffe01000;
-initstack   = 2048;
+initstack   = 16384;
 
 PHDRS {
     load PT_LOAD;
@@ -26,10 +26,6 @@ SECTIONS {
     .bss (NOLOAD) : ALIGN(0x1000) {
         *(.bss .bss.*);
     } : load
-
-    .stack_sizes (INFO) : {
-        KEEP(*(.stack_sizes));
-    }
 
     /DISCARD/ : {
 		*(.eh_frame .eh_frame.*);

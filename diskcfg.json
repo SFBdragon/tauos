@@ -6,6 +6,6 @@
     "initrd": { "gzip": true, "type": "echfs", "directory": "target/initrd" },
     "partitions": [
         { "type": "boot", "size": 16 },
-        { "type": "ext2", "size": 128, "name": "TauOS System Partition", "directory": "target/tsp" }
+        { "type": "ext2", "size": 48, "name": "TauOS System Partition", "directory": "target/tsp" }
     ]
 }

@@ -25,104 +25,104 @@ pub const PML4E_SIZE: usize = 0x8000000000;
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PageSize {
-    PTE4KiB   = PTE_SIZE,
-    PDE2MiB   = PDE_SIZE,
-    PDPTE1GiB = PDPTE_SIZE,
+    PTE4KiB    = PTE_SIZE,
+    PDE2MiB    = PDE_SIZE,
+    PDPTE1GiB  = PDPTE_SIZE,
+}
+impl PageSize {
+    /// ### Safety:
+    /// `size` must be `PTE_SIZE`, `PDE_SIZE`, or `PDPTE_SIZE`.
+    pub const unsafe fn from_usize(size: usize) -> PageSize {
+        core::mem::transmute(size)
+    }
 }
 
 
-pub const PT_LEVEL: usize = 1;
-pub const PD_LEVEL: usize = 2;
-pub const PDPT_LEVEL: usize = 3;
-pub const PML4_LEVEL: usize = 4;
+pub const PT_LVL: usize = 1;
+pub const PD_LVL: usize = 2;
+pub const PDPT_LVL: usize = 3;
+pub const PML4_LVL: usize = 4;
 
 bitflags::bitflags! {
     /// Page Table Entry flags. 
     /// Generic over all long mode page tables, see flag documentation for details.
     pub struct PTE: usize {
-        /// P: When set, determines that the physical page base specified is 
-        /// loaded in physical memory. When clear, the rest of the entry becomes 
-        /// available for software use.
-        const PRESENT = 1 << 0;
+        /// Present: When set, determines that the physical page base specified
+        /// is loaded in physical memory. When clear, the rest of the entry 
+        /// becomes available for software use.
+        const P = 1 << 0;
 
-        /// R/W: When set, allows write and read permissions, else readonly. 
-        /// Does not cascade.
-        const WRITE = 1 << 1;
-        /// U/S: When set, allows user (CPL3) access, else access is supervisor 
-        /// only (CPL 0,1,2). Does not cascade.
-        const USERLAND = 1 << 2;
-        /// PWT: When set, a writethrough policy is employed instead of writeback 
-        /// for the physical page/page-translation table.
-        const PAGE_WRITE_THROUGH = 1 << 3;
-        /// PCD: When set, caching is disabled for the physical 
+        /// Read/Write: When set, allows write and read permissions,
+        /// else readonly. Does not cascade.
+        const RW = 1 << 1;
+        /// User/Supervisor: When set, allows user (CPL3) access, 
+        /// else access is supervisor only (CPL 0,1,2). Does not cascade.
+        const US = 1 << 2;
+        /// Page write-through: When set, a writethrough policy is employed 
+        /// instead of writeback for the physical page/page-translation table.
+        const PWT = 1 << 3;
+        /// Page Cache Disable: When set, caching is disabled for the physical 
         /// page/page-translation table.
-        const PAGE_CACHE_DISABLE = 1 << 4;
+        const PCD = 1 << 4;
 
         /// A: When set, the CPU has accessed the physical 
         /// page/page-translation table.
-        const ACCESSED = 1 << 5;
+        const A = 1 << 5;
         /// D: When a leaf table, and set, indicates the CPU has written to 
         /// the physical page/page-translation table.
         /// 
         /// Ignored for branch tables.
-        const DIRTY = 1 << 6;
+        const D = 1 << 6;
 
 
-        /// PS: When not a Page Table (level 1) entry, when set, indicates that 
-        /// this maps a large page directly, else references an address 
-        /// translation page table.
-        const HUGE_PAGE = 1 << 7;
-        /// PAT: When a Page Table (level 1) entry, determines the high-order 
+        /// Page Size: When not a Page Table (level 1) entry, when set,
+        /// indicates that this maps a large page directly, else references 
+        /// an address translation page table.
+        const PS = 1 << 7;
+        /// When a Page Table (level 1) entry, determines the high-order 
         /// bit of a 3-bit index into the PAT register.
-        /// 
-        /// Not supported by all processors.
         const PAT = 1 << 7;
         
-        /// When set, and `CR4::PGE` is set (else is reserved), determines that 
-        /// that the TLB entry for a global page is not invalidated when CR3 is 
-        /// loaded either explicitly by a MOV CRn instruction or implicitly 
-        /// during a task switch.
-        const GLOBAL = 1 << 8;
+        /// Global: When set, and `CR4::PGE` is set (else is reserved),
+        /// determines that that the TLB entry for a global page is not 
+        /// invalidated when CR3 is loaded either explicitly by a MOV CRn 
+        /// instruction or implicitly during a task switch.
+        const G = 1 << 8;
 
         /// Bits available for use.
-        const AVAILABLE_MASK_0 = 0o7000;
+        const AVL_MASK_0 = 0o7000;
 
         
         /// When not a Page Table (level 1) entry, and `PTE::HUGE_PAGE` is set,
         /// determines the high-order bit of a 3-bit index into the PAT register.
-        /// Not supported by all processors.
         const PAT_PS = 1 << 12;
 
-        /// If page table is a leaf, i.e. `PTE::HUGE_PAGE` is set or this is a PTE,
-        /// defines the physical address of the mapped page.
+        /// Defines the physical address of the mapped page/next page table.
         /// 
         /// Alignment is determined by page table level, and the rest of the 
         /// bits are inferred to be zero:
         /// * Leaf PTE: 4KiB mapped page alignment, 12 bits inferred to be zero.
-        /// * Leaf PDE (`PTE::HUGE_PAGE`): 2MiB mapped page alignment, 21 bits 
+        /// * Leaf PDE (`Self::PS`): 2MiB mapped page alignment, 21 bits 
         /// inferred to be zero.
-        /// * Leaf PDPE (`PTE::HUGE_PAGE`): 1GiB mapped page alignment, 30 bits 
+        /// * Leaf PDPE (`Self::PS`): 1GiB mapped page alignment, 30 bits 
         /// inferred to be zero.
-        /// 
-        /// If page is a branch, i.e. `Self::PAT_PAGE_SIZE` is clear and this is 
-        /// not a PTE, defines the phyical address of a page table. Alignment is 4KiB.
         /// 
         /// The 52-bit address size limit is architecture defined for AMD64, 
-        /// in long mode (`CR4::PAE` is set), but may be less depending on implementation.
+        /// in long mode, but may be less depending on implementation.
         const BASE_MASK           = 0o000017_777_777_777_777_0000;
 
         /// Bits available for use.
-        const AVAILABLE_MASK_1    = 0o003760_000_000_000_000_0000;
+        const AVL_MASK_1    = 0o003760_000_000_000_000_0000;
 
         /// When `CR4::PKE` is set, and table is a leaf, determines the protection 
         /// key used for the mapped page.
         /// Available when `CR4::PKE` is clear, or when this table is not a leaf.
-        const PROTECTION_KEY_MASK = 0o074000_000_000_000_000_0000;
+        const PKM = 0o074000_000_000_000_000_0000;
 
         /// When set, and `EFER::NXE` is set (else is reserved), determines that 
         /// instruction fetches are not allowed to occur within the 
         /// directly/indirectly mapped page/s.
-        const NO_EXECUTE = 1 << 63;
+        const NX = 1 << 63;
     }
 }
 
@@ -140,19 +140,158 @@ impl PTE {
     }
 
     #[inline]
+    pub const fn from_pat(pat_idx: u8, is_hpage: bool) -> PTE {
+        let mut pte = PTE::empty();
+
+        if pat_idx & 1 << 0 != 0 {
+            pte = pte.union(PTE::PWT);
+        }
+        if pat_idx & 1 << 1 != 0 {
+            pte = pte.union(PTE::PCD);
+        }
+        if pat_idx & 1 << 2 != 0 {
+            if is_hpage {
+                pte = pte.union(PTE::PAT_PS);
+            } else {
+                pte = pte.union(PTE::PAT);
+            }
+        }
+
+        pte
+    }
+
+    #[inline]
     pub const fn get_paddr(&self) -> usize {
         self.bits & PTE::BASE_MASK.bits
     }
 }
 
 
+// PAT
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PatType {
+    /// All accesses are uncacheable. Write combining is not allowed.
+    /// Speculative accesses are not allowed.
+    Uncacheable = 0,
+    /// All accesses are uncacheable. Write combining is allowed.
+    /// Speculative reads are allowed.
+    WriteCombining = 1,
+    /// Reads allocate cache lines on a cache miss, but only to the shared state.
+    /// Cache lines are not allocated on a write miss. Write hits update the cache
+    /// and main memory.
+    WriteThrough = 4,
+    /// Reads allocate cache lines on a cache miss, but only to the shared state.
+    /// All writes update main memory. Cache lines are not allocated on a write miss.
+    /// Write hits invalidate the cache line and update main memory.
+    WriteProtect = 5,
+    /// Reads allocate cache lines on a cache miss, and can allocate to either the
+    /// shared or exclusive state. Writes allocate to the modified state on a cache miss.
+    WriteBack = 6,
+    /// All accesses are uncacheable. Write combining is not allowed. Speculative
+    /// accesses are not allowed. Can be overridden by an MTRR with the WC type.
+    UncacheableMinus = 7,
+}
+impl PatType {
+    pub fn from_bits(code: u8) -> Self {
+        match code {
+            0 => PatType::Uncacheable,
+            1 => PatType::WriteCombining,
+            4 => PatType::WriteThrough,
+            5 => PatType::WriteProtect,
+            6 => PatType::WriteBack,
+            7 => PatType::UncacheableMinus,
+            _ => panic!("Invalid PAT type.")
+        }
+    }
+
+    pub fn to_bits(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pat {
+    /// PAT types used where the PAT bit is **clear**.
+    pub std_types: [PatType; 4],
+    /// PAT types used where the PAT bit is **set**.
+    pub pat_types: [PatType; 4],
+}
+impl Default for Pat {
+    /// Returns the reset value for the register.
+    /// 
+    /// `pat_types` are a clone of `std_types`.
+    fn default() -> Self {
+        // index = {PAT, PCD, PWT} bits
+        Self {
+            std_types: [
+                PatType::WriteBack,
+                PatType::WriteThrough,
+                PatType::UncacheableMinus,
+                PatType::Uncacheable,
+            ],
+            pat_types: [
+                PatType::WriteBack,
+                PatType::WriteThrough,
+                PatType::UncacheableMinus,
+                PatType::Uncacheable,
+            ]
+        }
+    }
+}
+impl Pat {
+    pub const PAT_MSR: u64 = 0x00000277;
+
+    /// Read the data in the PAT MSR.
+    pub fn read() -> Self {
+        let pat_msr = crate::registers::rdmsr(Self::PAT_MSR);
+
+        Pat {
+            std_types: [
+                PatType::from_bits((pat_msr >> 00) as u8),
+                PatType::from_bits((pat_msr >> 08) as u8),
+                PatType::from_bits((pat_msr >> 16) as u8),
+                PatType::from_bits((pat_msr >> 24) as u8),
+            ],
+            pat_types: [
+                PatType::from_bits((pat_msr >> 32) as u8),
+                PatType::from_bits((pat_msr >> 40) as u8),
+                PatType::from_bits((pat_msr >> 48) as u8),
+                PatType::from_bits((pat_msr >> 56) as u8),
+            ]
+        }
+    }
+
+    /// Write the data to the PAT MSR.
+    /// ### Safety:
+    /// Caller must guarantee that the new PAT will not cause memory unsafety.
+    pub unsafe fn write(self) {
+        let mut pat = 0;
+
+        pat |= (self.std_types[0].to_bits() as u64) << 00;
+        pat |= (self.std_types[1].to_bits() as u64) << 08;
+        pat |= (self.std_types[2].to_bits() as u64) << 16;
+        pat |= (self.std_types[3].to_bits() as u64) << 24;
+        pat |= (self.pat_types[0].to_bits() as u64) << 32;
+        pat |= (self.pat_types[1].to_bits() as u64) << 40;
+        pat |= (self.pat_types[2].to_bits() as u64) << 48;
+        pat |= (self.pat_types[3].to_bits() as u64) << 56;
+
+        crate::registers::wrmsr(Self::PAT_MSR, pat);
+    }
+}
+
+
+
+
 // GENERAL PAGE TABLE UTILS
+
 
 /// Return the size of the virtual memory that a given page table entry spans, 
 /// where a PDPT entry is `level` 3, a PDT is entry `level` 2, and so on.
-#[inline]
 pub const fn page_size(lvl: usize) -> usize {
-    (lvl - 1) * 0o1000 * 0o10000
+    0o10 << lvl * 9
 }
 
 /// Extract the index into the given level of page table, where the index into 

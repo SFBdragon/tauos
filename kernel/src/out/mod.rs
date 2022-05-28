@@ -2,7 +2,6 @@
 pub mod uart;
 pub mod framebuffer;
 
-
 // print! & println! implementations
 
 #[macro_export]
@@ -20,7 +19,10 @@ macro_rules! println {
 pub fn __print(args: core::fmt::Arguments) {
     use core::fmt::Write;
 
-    // todo: fix for firmware
-    uart::UART_COM1.0.lock().write_fmt(args).unwrap_or_else(|_| ());
+    // todo: fix for firmware  (?)
+    match uart::UART_COM1.0.try_lock() {
+        Some(mut lock) => lock.write_fmt(args).unwrap(),
+        None => {},
+    }
     // todo: framebuffer output
 }

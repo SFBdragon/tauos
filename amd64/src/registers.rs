@@ -3,14 +3,12 @@
 use core::arch::asm;
 
 pub const APIC_BASE_MSR: u64 = 0x0000001B;
-
-pub const EFER_MSR: u64 = 0xC0000080;
-pub const MPERF_MSR: u64 = 0xC00000E7;
-pub const APERF_MSR: u64 = 0xC00000E8;
+pub const EFER_MSR: u64 =      0xC0000080;
+pub const MPERF_MSR: u64 =     0xC00000E7;
+pub const APERF_MSR: u64 =     0xC00000E8;
 
 
 bitflags::bitflags! {
-
     pub struct RFLAGS: u64 {
         /// Carry Flag
         const CF = 1 << 0;
@@ -294,6 +292,13 @@ pub struct CR3 {
 impl CR3 {
     const PCID_MASK: usize = 0o777;
 
+    /// Sets CR3 given the given physical address, no PCID, and no flags set.
+    /// ### Safety:
+    /// See `CR3::write`.
+    pub unsafe fn set_nflags(pml4_paddr: usize) {
+        CR3 { data: CR3Data::Flags(CR3Flags::empty()), paddr: pml4_paddr }.write()
+    }
+
     /// Reads the CR3.
     pub fn read() -> Self {
         let paddr_mask = crate::paging::PTE::BASE_MASK.bits();
@@ -369,6 +374,17 @@ impl CR3 {
                 options(nomem, nostack, preserves_flags)
             );
         }
+    }
+
+    /// Return a linear address to the PML4.
+    /// ### Safety:
+    /// This function assumes identity-offset mapping.
+    #[inline]
+    pub unsafe fn get_laddr_offset(&self, offset: isize) -> *mut [crate::paging::PTE] {
+        core::ptr::slice_from_raw_parts_mut(
+            (self.paddr as isize + offset) as *mut _, 
+            512
+        )
     }
 }
 

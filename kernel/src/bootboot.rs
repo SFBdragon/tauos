@@ -22,10 +22,10 @@ pub const MMAP_FREE: u64 = 1;
 pub const MMAP_ACPI: u64 = 2;
 pub const MMAP_MMIO: u64 = 3;
 
-pub const FRAMEBUFFER: *const u8 = 0xfffffffffc000000 as *const _;
+pub const FRAMEBUFFER: *mut u8 = 0xfffffffffc000000 as *mut _;
 pub const ENV_CFG: *const u8 = 0xffffffffffe01000 as *const _;
 pub const BOOTBOOT: *const BootBoot = 0xffffffffffe00000 as *const _;
-pub const MMAP: *const MMapEntry = BOOTBOOT.wrapping_offset(1) as *const _;
+pub const MMAP: *mut MMapEntry = BOOTBOOT.wrapping_offset(1) as *mut _;
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
