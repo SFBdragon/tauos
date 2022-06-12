@@ -257,8 +257,8 @@ impl CR4 {
 
 
 /// Control Register 2 (CR2) contains the Page Fault Linear Address (PFLA) when a page fault occurs.
-pub fn cr2_read() -> u64 {
-    let cr2: u64;
+pub fn cr2_read() -> *const u8 {
+    let cr2: *const u8;
     unsafe {
         asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     }

@@ -1,9 +1,18 @@
 #![no_std]
 #![no_main]
 
-#![feature(ptr_metadata)]
 #![feature(alloc_error_handler)]
 
+#![feature(const_slice_from_raw_parts)]
+#![feature(nonnull_slice_from_raw_parts)]
+#![feature(slice_ptr_get)]
+#![feature(allocator_api)]
+#![feature(abi_x86_interrupt)]
+#![feature(slice_ptr_len)]
+
+#![feature(naked_functions)]
+#![feature(core_intrinsics)]
+#![feature(asm_const)]
 
 extern crate alloc;
 
@@ -11,17 +20,32 @@ extern crate alloc;
 #[allow(dead_code)]
 mod bootboot;
 
-use core::{panic::PanicInfo, sync::atomic::{AtomicUsize, Ordering}, ptr, mem};
+use core::{panic::PanicInfo, sync::atomic::{AtomicUsize, Ordering}, alloc::{Layout, GlobalAlloc, AllocError}, ptr};
  
-use alloc::vec::Vec;
-use amd64::{self, paging, registers::{self, CR3}};
-use libkernel::{println, memm, utils};
+use alloc::boxed::Box;
+use amd64::{self, paging, registers::CR3};
+use sys::{println, memm::{self, talloc::{Tallock, Talloc}}, from_phys_addr, cfg};
+
+
+// NO GLOBAL ALLOCATOR
+// Each CPU gets their own allocator, use that one.
+struct Panicator;
+unsafe impl GlobalAlloc for Panicator {
+    unsafe fn alloc(&self, _: Layout) -> *mut u8 { panic!("No global allocator!"); }
+    unsafe fn dealloc(&self, _: *mut u8, _: Layout) { panic!("No global allocator!"); }
+}
+#[global_allocator]
+static PANICATOR: Panicator = Panicator;
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    panic!("Allocator Error: {:?}", layout)
+}
 
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // ASSUME BOOTBOOT
-
+    
     unsafe { memm::KRNL_DEFAULT_PAT.write(); }
 
     static THREAD_TICKET: AtomicUsize = AtomicUsize::new(0);
@@ -30,81 +54,40 @@ pub extern "C" fn _start() -> ! {
     static IS_MAPPER_INITD_PML4: AtomicUsize = AtomicUsize::new(usize::MAX);
     
     if thread_ticket == 0 {
-        println!("[BSP] KERNEL _START!");
-
         unsafe {
-            // set up mapper & physical memory management
-
-            let mmap_size = (*bootboot::BOOTBOOT).size as usize - mem::size_of::<bootboot::BootBoot>();
-            let mmap_len = mmap_size / mem::size_of::<bootboot::MMapEntry>();
-            let mmap = core::slice::from_raw_parts_mut(bootboot::MMAP, mmap_len)/* .split_last_mut().unwrap().1 */;
-
-            // check if free blocks are actually usable
-            for entry in mmap.iter_mut().filter(|e| e.data & bootboot::MMAP_FREE != 0) {
-                let base_ptr = entry.ptr as *mut u8;
-                let val = base_ptr.read_volatile();
-                base_ptr.write_volatile(0xAE);
-                let invalid = base_ptr.read_volatile() != 0xAE;
-                base_ptr.write_volatile(val);
-                if invalid {
-                    entry.data &= !bootboot::MMAP_FREE;
+            sys::out::terminal::TERM1.lock().fb = sys::out::framebuffer::FrameBuffer::new(
+                bootboot::FRAMEBUFFER, 
+                (*bootboot::BOOTBOOT).fb_width as usize,
+                (*bootboot::BOOTBOOT).fb_height as usize,
+                (*bootboot::BOOTBOOT).fb_scanline as usize,
+                match (*bootboot::BOOTBOOT).fb_type {
+                    bootboot::FB_ABGR => sys::out::framebuffer::PixelFormat::ABGR,
+                    bootboot::FB_ARGB => sys::out::framebuffer::PixelFormat::ARGB,
+                    bootboot::FB_BGRA => sys::out::framebuffer::PixelFormat::BGRA,
+                    bootboot::FB_RGBA => sys::out::framebuffer::PixelFormat::RGBA,
+                    _ => panic!()
                 }
-            }
-
-            let mmap_iter = &mmap.iter()
-                .filter(|&entry| entry.data & bootboot::MMAP_FREE != 0)
-                .map(|entry| (
-                    entry.ptr as usize,
-                    entry.data as usize & bootboot::MMAP_DATA_SIZE_MASK as usize,
-                ));
-            let pml4_paddr = memm::Mapper::setup(mmap_iter);
-
-            // set up allocator
-
-            /* println!("mapped");
-
-            const KRNL_HEAP_BASE: *mut u8 = (memm::KRNL_STACK_ACME - (paging::PDPTE_SIZE * 2)) as *mut _;
-            const KRNL_HEAP_SIZE: usize = paging::PDE_SIZE * 32;
-            const KRNL_HEAP_SMLL: usize = 64;
-            memm::MAPPER.lock().map(
-                KRNL_HEAP_BASE,
-                KRNL_HEAP_SIZE,
-                paging::PTE::RW,
-                paging::PTE::RW,
-                CR3::read().get_laddr_offset(memm::PHYS_LADDR_OFFSET)
             );
-            println!("mapped alloc");
-
-            let (llists_len, bitmap_len) = memm::talloc::Talloc::slice_lengths(
-                KRNL_HEAP_SIZE, KRNL_HEAP_SMLL);
-            let slice_bytes = llists_len * mem::size_of::<utils::llist::LlistNode<()>>() + bitmap_len;
-            memm::MAPPER.lock().map(
-                KRNL_HEAP_BASE.wrapping_sub(slice_bytes),
-                slice_bytes,
-                paging::PTE::RW,
-                paging::PTE::RW,
-                CR3::read().get_laddr_offset(memm::PHYS_LADDR_OFFSET)
-            );
-            println!("mapped alloc slice");
-            let llists = core::ptr::slice_from_raw_parts_mut(KRNL_HEAP_BASE.wrapping_sub(slice_bytes) as *mut _, llists_len);
-            let bitmap = core::ptr::slice_from_raw_parts_mut(KRNL_HEAP_BASE.wrapping_sub(bitmap_len) as *mut _, bitmap_len);
-
-            println!("afdsg");
-
-            memm::ALLOCATOR.new_valid(
-                KRNL_HEAP_BASE, 
-                KRNL_HEAP_SIZE, 
-                KRNL_HEAP_SMLL, 
-                llists, 
-                bitmap
-            );
-            let range = memm::ALLOCATOR.lock().bound_available(KRNL_HEAP_BASE, KRNL_HEAP_SIZE);
-            memm::ALLOCATOR.lock().release(range); */
-
-            IS_MAPPER_INITD_PML4.store(pml4_paddr, Ordering::SeqCst);
         }
+
+        println!("[BSP] KERNEL _START! ");
+        sys::print!("{}", char::from_u32(31).unwrap());
+
+        if true { // BOOTBOOT
+            // Store configuration file as static data.
+            // SAFETY: this is only called once,
+            // mapping is unchanged, bootloader is BOOTBOOT
+            cfg::init_boot_cfg(unsafe { bootboot::env_cfg_as_str() });
+        }
+
+        // set up mapper & physical memory management
+        let pml4_paddr = unsafe {
+            let iter = bootboot::mmap_available_iter();
+            memm::Mapper::setup(&iter)
+        };
+
+        IS_MAPPER_INITD_PML4.store(pml4_paddr, Ordering::SeqCst);
     } else {
-        //println!("T{}: waiting...", thread_ticket);
         while IS_MAPPER_INITD_PML4.load(Ordering::SeqCst) == usize::MAX {
             unsafe {
                 core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
@@ -151,25 +134,31 @@ fn init() -> ! {
 
     println!("T{}: KERNEL INIT", thread_ticket);
 
-    /* let mut vec = Vec::new();
-    vec.push("something");
-    vec.push("victory");
-    println!("{}", vec.pop().unwrap()); */
+    let mut talloc = unsafe { allocator_setup(thread_ticket) };
+    let (gdt, idt, tss) = unsafe { setup_sys_tables(talloc.as_ref()) };
+
+    if thread_ticket == 0 {
+        unsafe { core::arch::asm!("int3"); }
+        unsafe { core::arch::asm!("nop"); }
+        unsafe { core::arch::asm!("nop"); }
+        unsafe { core::arch::asm!("nop"); }
+        //unsafe { core::arch::asm!("int 13"); }
+        unsafe { core::arch::asm!("mov [48879], eax"); } // ISRs with error codes are breaking!
+        //unsafe { amd64::registers::CR0::write(amd64::registers::CR0::read() & !amd64::registers::CR0::PG); }
+    }
+
+    // double/triple buffer the framebuffer!
+    
 
     amd64::hlt_loop();
 
+
     // extract data from bb structs
-    
-    // framebuffer setup?
-    
-    // alloc
 
     // acpi rsdp
     // acpihandler
     // acpi
-    // madt
-    
-    //mem::segmentation_setup();
+    // madtd
 
     // apic
     // idt & interrupt handling
@@ -178,6 +167,7 @@ fn init() -> ! {
     //amd64::hlt_loop()
 }
 
+
 #[panic_handler]
 fn panic_handler(info: &PanicInfo) -> ! {
     println!("{}", info);
@@ -185,45 +175,253 @@ fn panic_handler(info: &PanicInfo) -> ! {
     amd64::hlt_loop()
 }
 
-#[alloc_error_handler]
-fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
-    panic!("Allocator Error: {:?}", layout)
+
+
+/// Sets up an allocator for this CPU and returns itself allocated on it's own heap.
+unsafe fn allocator_setup(thread_ticket: usize) -> Box<Tallock, &'static Tallock> {
+    use core::alloc::Allocator;
+
+    let heap_base = -(paging::PDPTE_SIZE as isize) * (2 + thread_ticket as isize);
+    let heap_size = cfg::heap_init_size();
+    let heap_smlst_block = cfg::heap_smlst_block();
+
+    memm::MAPPER.lock().map(
+        heap_base as *mut u8,
+        heap_size,
+        paging::PTE::RW,
+        paging::PTE::RW,
+        core::ptr::slice_from_raw_parts_mut(from_phys_addr!(CR3::read().paddr, paging::PTE), 512)
+    );
+
+    let tallock = memm::talloc::Tallock(spin::Mutex::new(
+        memm::talloc::Talloc::new(
+            heap_base, 
+            heap_size, 
+            heap_smlst_block, 
+            core::ptr::slice_from_raw_parts_mut(heap_base as *mut _, heap_size), 
+            oom_handler
+        )   
+    ));
+
+    let tallock_ptr = tallock.allocate(Layout::new::<Tallock>()).expect("Tallock allocate failed.");
+    tallock_ptr.as_mut_ptr().cast::<Tallock>().write(tallock);
+
+    let tallock_box = Box::from_raw_in(
+        tallock_ptr.as_mut_ptr().cast::<Tallock>(), 
+        tallock_ptr.as_mut_ptr().cast::<Tallock>().as_ref().unwrap()
+    );
+
+    tallock_box
+}
+
+fn oom_handler(talloc: &mut Talloc, layout: Layout) -> Result<(), AllocError> {
+    let (arena_base, arena_size) = talloc.get_arena();
+
+    let max_arena_size = paging::PDPTE_SIZE - cfg::stack_size() - paging::PTE_SIZE;
+    let lgr_size = (arena_size * 2).min(max_arena_size);
+    let free_mem_size = talloc.req_free_mem(arena_base, lgr_size);
+
+    // ensure there is 1) sufficient room to expand, 2) enough space for status data
+    if arena_size < lgr_size - free_mem_size {
+        unsafe {
+            memm::MAPPER.lock().map(
+                (arena_base + arena_size as isize) as *mut _, 
+                lgr_size - arena_size, 
+                paging::PTE::RW, 
+                paging::PTE::RW, 
+                CR3::read().get_laddr_offset(memm::PHYS_LADDR_OFFSET),
+            );
+    
+            talloc.extend(
+                arena_base,
+                lgr_size,
+                core::ptr::slice_from_raw_parts_mut((arena_base + arena_size as isize) as *mut _, lgr_size - arena_size)
+            );
+
+        }
+
+        Ok(())
+    } else {
+        Err(AllocError)
+    }
+}
+
+
+use amd64::{
+    PrivLvl,
+    segmentation::{self, SegSel, SysSegDesc, TaskStateSeg, CodeSegDesc, DataSegDesc},
+    interrupts::{self, IDT, Ssdt, IntTrapGate, InterruptStackFrame},
+};
+
+
+pub const KRNL_CODE_SEG_IDX: u16 = 1;
+pub const KRNL_CODE_SEG_SEL: SegSel = SegSel::new_gdt(PrivLvl::Ring0, KRNL_CODE_SEG_IDX);
+pub const USER_CODE_SEG_IDX: u16 = 2;
+pub const USER_CODE_SEG_SEL: SegSel = SegSel::new_gdt(PrivLvl::Ring3, USER_CODE_SEG_IDX);
+pub const DATA_SEG_IDX: u16 = 3;
+pub const DATA_SEG_SEL: SegSel = SegSel::new_gdt(PrivLvl::Ring3, DATA_SEG_IDX);
+pub const TSS_SEG_IDX: u16 = 4;
+pub const TSS_SEG_SEL: SegSel = SegSel::new_gdt(PrivLvl::Ring0, TSS_SEG_IDX);
+
+pub unsafe fn setup_sys_tables(talloc: &crate::memm::talloc::Tallock)
+-> (Box<[u64], &Tallock>, Box<IDT, &Tallock>, Box<TaskStateSeg, &Tallock>, ) {
+
+    let tss = TaskStateSeg::new([ptr::null_mut(); 3], [ptr::null_mut(); 7]);
+    let mut tss = Box::new_in(tss, talloc);
+
+    let tss_desc = SysSegDesc::new(
+        tss.as_mut() as *mut _ as *mut _,
+        TaskStateSeg::LIMIT,
+        Ssdt::AvlTss,
+        PrivLvl::Ring0,
+        false,
+    );
+    let gdt = [
+        0,
+        (CodeSegDesc::default() | CodeSegDesc::DPL_RING0).bits(),
+        (CodeSegDesc::default() | CodeSegDesc::DPL_RING3).bits(),
+        DataSegDesc::default().bits(),
+        tss_desc.to_bits()[0],
+        tss_desc.to_bits()[1],
+    ];
+    let mut gdt = Box::new_in(gdt, talloc);
+
+    // load global descriptor table
+    segmentation::lgdt(gdt.as_mut() as *mut _);
+    // switch to new code segment
+    segmentation::cs_write(KRNL_CODE_SEG_SEL);
+    // switch data segments
+    core::arch::asm!(
+        "mov ds, {0:x}",
+        "mov es, {0:x}",
+        "mov fs, {0:x}",
+        "mov gs, {0:x}",
+        "mov ss, {0:x}",
+        in(reg) DATA_SEG_IDX,
+    );
+    // load new tss into the task register
+    segmentation::ltr(TSS_SEG_SEL);
+
+
+    let mut idt = Box::new_in(IDT::empty(), talloc);
+
+    // todo: create some ISTs and have abort exceptions use them
+    // todo: create more ISRs
+
+    idt.div_by_zero_fault = IntTrapGate::new(div_by_zero_fault as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
+    idt.debug = IntTrapGate::new(debug_exception as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
+    idt.break_point_trap = IntTrapGate::new(break_point_trap as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
+    idt.double_fault_abort = IntTrapGate::new(double_fault_abort as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.page_fault = IntTrapGate::new(page_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.general_protection_fault = IntTrapGate::new(general_protection_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+
+    interrupts::lidt(idt.as_ref() as *const _);
+
+    (gdt, idt, tss)
+}
+
+
+extern "x86-interrupt" fn div_by_zero_fault(stack_frame: InterruptStackFrame) {
+    crate::println!("DIV BY ZERO FAULT!\nStack Frame: {:#?}", stack_frame);
+
+    amd64::hlt_loop();
+}
+
+extern "x86-interrupt" fn debug_exception(stack_frame: InterruptStackFrame) {
+    crate::println!("DEBUG EXCEPTION!\nStack Frame: {:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn break_point_trap(stack_frame: InterruptStackFrame) {
+    /* let rsp: *const u64;
+    unsafe { core::arch::asm!("lea {}, [rsp+0]", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+    let slice = core::ptr::slice_from_raw_parts(rsp.wrapping_sub(0x100), 0x200);
+    println!();
+    for i in (0..slice.len()).rev() {
+        sys::print!("{:x} ", unsafe { *slice.get_unchecked(i) });
+    }
+    let ptr = core::ptr::addr_of!(stack_frame);
+    println!("{:p} {:p}", rsp, ptr); */
+    crate::println!("BREAK POINT TRAP!\nStack Frame: {:#?}", &stack_frame);
+}
+
+/* #[naked]
+extern "C" fn naked_page_fault_wrapper() -> ! {
+    unsafe {
+        asm!("mov rdi, rsp; call $0"
+             :: "i"(divide_by_zero_handler as extern "C" fn(_) -> !)
+             : "rdi" : "intel");
+        ::core::intrinsics::unreachable();
+    }
+} */
+/* extern "C" fn naked_page_fault_wrapper() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rdi, rsp",
+            "jmp naked_page_fault",
+            options(noreturn),
+        );
+    }
+}
+#[no_mangle]
+extern "C" fn naked_page_fault(stack_frame: InterruptStackFrame, err_code: u64) -> ! {
+    let cr2 = amd64::registers::cr2_read();
+    crate::println!(
+        "PAGE FAULT!\nStack Frame: {:#?}\nError code: {:?}\nCR2: {:p}",
+        &stack_frame,
+        unsafe { interrupts::PfErrCode::from_bits_unchecked(err_code) },
+        cr2
+    );
+    amd64::hlt_loop();
+} */
+
+
+extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame/* , err_code: u64 */) {
+    /* let rsp: *const u64;
+    unsafe { core::arch::asm!("lea {}, [rsp+0]", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+    let slice = core::ptr::slice_from_raw_parts(rsp.wrapping_sub(0x100), 0x200);
+    println!();
+    for i in (0..slice.len()).rev() {
+        sys::println!("{:p} {:x}", unsafe {  slice.get_unchecked(i) }, unsafe { *slice.get_unchecked(i) });
+    }
+    //unsafe { core::arch::asm!("lea rsp, [rsp-16]", options(nomem, nostack, preserves_flags)); }
+    let ptr = core::ptr::addr_of!(stack_frame);
+    println!("rsp {:p}, isf ptr {:p}", rsp, ptr);
+    // let ptr = ptr.cast::<u8>().wrapping_sub(128).cast::<InterruptStackFrame>(); */
+
+    let stack_frame_ptr = core::ptr::addr_of!(stack_frame).cast::<u8>().wrapping_add(8).cast::<InterruptStackFrame>();
+    let err_code_ptr = core::ptr::addr_of!(stack_frame).cast::<u64>()/* .wrapping_sub(1) */;
+
+    let cr2 = amd64::registers::cr2_read();
+    crate::println!(
+        "PAGE FAULT!\nStack Frame: {:#?}\nError code: {:?}\nCR2: {:p}",
+        unsafe { *stack_frame_ptr },
+        unsafe { interrupts::PfErrCode::from_bits_unchecked(unsafe { *err_code_ptr }) },
+        cr2
+    );
+
+    amd64::hlt_loop();
+}
+
+extern "x86-interrupt" fn double_fault_abort(stack_frame: InterruptStackFrame, err_code: u64) -> ! {
+    unsafe {
+        let fb = 0xfffffffffc000000 as *mut u8;
+        fb.wrapping_add(512).write_bytes(128, 256);
+    }
+
+    crate::println!("DOUBLE FAULT!\nStack Frame: {:#?}\nError Code: {:#?}", stack_frame, err_code);
+
+    amd64::hlt_loop();
+}
+
+extern "x86-interrupt" fn general_protection_fault(stack_frame: InterruptStackFrame, err_code: u64) {
+    crate::println!("GENERAL PROTECTION FAULT!\nStack Frame: {:#?}", stack_frame);
+    if err_code != 0 {
+        crate::println!("Segment Selector: {:#?}", SegSel::from_bits(err_code as u16));
+    }
+
+    amd64::hlt_loop();
 }
 
 
 
-pub fn segmentation_setup() {
-    // todo: properly alloc gdt and finish tss/fs/gs/other setup
-
-
-    // Segmentation is mostly disabled in long, 64-bit mode. However some elements are still used:
-    //  - The attributes of a code segment
-    //  - The FS and GS registers and associated data segments
-    //  - The TS register and associated TSS
-    //
-    // For now, the GDT set up by the UEFI is taken over and overwritten, and a basic layout is issued.
-
-    // nab the uefi gdt for now
-    /* let uefi_gdt = segmentation::sgdt();
-    
-
-    uefi_gdt.iter_mut().for_each(|entry| *entry = 0);
-
-    uefi_gdt[0] = 0;
-    uefi_gdt[1] = 
-        ( CodeSegmentDescriptor::PRESENT
-        | CodeSegmentDescriptor::CONFORMING
-        | CodeSegmentDescriptor::EXECUTABLE
-        | CodeSegmentDescriptor::TYPE
-        | CodeSegmentDescriptor::LONG_MODE
-        | CodeSegmentDescriptor::DPL_RING0).bits();
-
-    unsafe {
-        // load in the GDT just to make sure
-        segmentation::lgdt(uefi_gdt);
-
-        // reset CS register so that the new GDT entry is used
-        segmentation::cs_write(SegmentSelector::new_gdt(amd64::PrivLvl::Ring0, 1));
-    } */
-} 
 

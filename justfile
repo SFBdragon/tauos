@@ -65,7 +65,7 @@ build profile='dev':
     @echo ''
 
 run profile='dev': (build profile)
-    qemu-system-x86_64.exe -nodefaults -vga std -serial stdio -no-reboot \
+    qemu-system-x86_64.exe -nodefaults -vga std -serial stdio -no-reboot -d cpu_reset \
         -drive if=pflash,format=raw,file=./dev/OVMF_CODE-pure-efi.fd,readonly=on \
         -drive if=pflash,format=raw,file=./dev/OVMF_VARS-pure-efi.fd,readonly=on \
         -machine q35 -cpu max -smp 4 -m 2G \

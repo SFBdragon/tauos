@@ -8,6 +8,7 @@
 #![no_std]
 
 #![feature(ptr_to_from_bits)]
+#![feature(slice_ptr_get)]
 #![feature(abi_x86_interrupt)]
 
 pub mod registers;
@@ -33,22 +34,22 @@ pub enum PrivLvl {
 
 impl PrivLvl {
     #[inline]
-    pub fn from_bits(from: u8) -> Self {
+    pub const fn from_bits(from: u8) -> Self {
         match from {
             0b00 => PrivLvl::Ring0,
             0b01 => PrivLvl::Ring1,
             0b10 => PrivLvl::Ring2,
             0b11 => PrivLvl::Ring3,
-            _ => panic!("Invalid x86 priviledge level: {}", from),
+            _ => panic!("Invalid x86 priviledge level"),
         }
     }
 
     #[inline]
-    pub fn to_bits(self) -> u8 {
+    pub const fn to_bits(self) -> u8 {
         self as u8
     }
 
-    pub fn is_userland(self) -> bool {
+    pub const fn is_userland(self) -> bool {
         matches!(self, PrivLvl::Ring3)
     }
 }

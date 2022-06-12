@@ -19,5 +19,5 @@ name = "kernel"
 path = "src/init.rs"
 
 [lib]
-name = "libkernel"
+name = "sys"
 path = "src/lib.rs"

@@ -6,7 +6,7 @@ use core::cell::Cell;
 /// The linked list is:
 ///  * **intrusive** to minimize indirection
 ///  * **circular** to minimize branches
-///  * **uses the concept of a 'head' node** which is homogenous, but isn't iterated over
+///  * **'sentinel' node** which is homogenous, but isn't iterated over
 ///  * **implicitly non-zero in length** by virtue of the lack of a heterogenous component
 ///  * **doubly linked** to allow bidirectional traversal and single ref removal
 ///  * **very unsafe** due to pointer usage, inter-referenciality, and self-referenciality
@@ -16,14 +16,6 @@ use core::cell::Cell;
 /// as well as the self-referencial configuration with linked lists of length 1. This requires
 /// that `LlistNode`s are never moved manually, otherwise using the list becomes memory
 /// unsafe and may lead to undefined behaviour.
-/// 
-/// Generally speaking, traversal while holding references to multiple nodes is also potentially
-/// undefined behaviour/memory unsafe due to the risk of aliasing mutable pointers. Exclusive
-/// access to the list is recommended to be maintained through a sentinel node where possible.
-/// See traversal methods' docs for more detail. Miri has been used to test the unsafety thereof,
-/// and generally causing undefined bahviour is difficult without holding references to `data`
-/// through other references to nodes while traversing with self. Thus making `data` a `Cell` may
-/// further mitigate the possiblity of misuse.
 /// 
 /// This data structure is not thread-safe, use mutexes/locks to mutually exclude data access.
 #[derive(Debug)]
@@ -38,20 +30,18 @@ impl<T> LlistNode<T> {
     /// 
     /// Warning: This will not call `remove` on `node`, regardless of initialization. 
     /// It is your responsibility to make sure `node` gets `remove`d if necessary.
-    /// Failing to do so when is not undefined behaviour or memory unsafe, but 
+    /// Failing to do so is not undefined behaviour or memory unsafe, but 
     /// may cause complex and unexpected linkages.
     /// 
     /// ### Safety:
     /// * `node` must be valid for writes and properly aligned.
     #[inline]
-    pub fn new_llist(node: *mut Self, data: T) {
-        unsafe {
-            node.write(Self {
-                data,
-                prev: Cell::new(node),
-                next: Cell::new(node),
-            });
-        }
+    pub unsafe fn new_llist(node: *mut Self, data: T) {
+        node.write(Self {
+            data,
+            prev: Cell::new(node),
+            next: Cell::new(node),
+        });
     }
 
     /// Create a new node as a member of an existing linked list in place of `node`.
@@ -83,27 +73,31 @@ impl<T> LlistNode<T> {
     /// * `dest` must be `ptr::write`-able.
     /// * `self` must be dereferencable and valid.
     pub unsafe fn mov(src: *mut Self, dst: *mut Self) {
+        // src.{prev,next} can of course be *src, hence order of ops is important
+        let src_prev = (*src).prev.get();
+        let src_next = (*src).next.get();
+        (*src_prev).next.set(dst);
+        (*src_next).prev.set(dst);
+
         dst.write(src.read());
-
-        (*(*dst).prev.get()).next.set(dst);
-        (*(*dst).next.get()).prev.set(dst);
-
-        (*src).prev.set(src);
-        (*src).next.set(src);
+        
+        (*src).prev.set(0xabc as *mut _);
+        (*src).next.set(0xabc as *mut _);
     }
 
     /// Remove `self` from it's linked list, leaving `self` as an isolated node.
     /// If `self` is linked only to itself, this is effectively a no-op.
     /// ### Safety:
     /// * `self` must be dereferencable and valid.
-    pub unsafe fn remove(node: *mut Self) {
+    pub unsafe fn remove(node: *mut Self) -> T {
         let prev = (*node).prev.get();
         let next = (*node).next.get();
         (*prev).next.set(next);
         (*next).prev.set(prev);
-
-        (*node).prev.set(node);
-        (*node).next.set(node);
+        
+        (*node).prev.set(0xdef as *mut _);
+        (*node).next.set(0xdef as *mut _);
+        node.read().data
     }
 
 
@@ -122,15 +116,15 @@ impl<T> LlistNode<T> {
     pub unsafe fn relink(start: *mut Self, end: *mut Self, prev: *mut Self, next: *mut Self) {
         // link up old list
         let start_prev = (*start).prev.get();
-        let end_next   = (*end  ).next.get();
+        let end_next   = (*end)  .next.get();
         (*start_prev).next.set(end_next);
-        (*end_next  ).prev.set(start_prev);
+        (*end_next)  .prev.set(start_prev);
 
         // link up new list
         (*start).prev.set(prev);
-        (*end  ).next.set(next);
-        (*prev ).next.set(start);
-        (*next ).prev.set(end);
+        (*end)  .next.set(next);
+        (*prev) .next.set(start);
+        (*next) .prev.set(end);
     }
 
 
@@ -140,10 +134,7 @@ impl<T> LlistNode<T> {
     /// `start`'s linked list must remain in a valid state during iteration.
     /// Modifying `LlistNode`s already returned by the iterator is okay.
     pub unsafe fn iter_mut(sentinel: *mut Self) -> IterMut<T> {
-        IterMut::new(
-            (*sentinel).next.get(), 
-            (*sentinel).prev.get()
-        )
+        IterMut::new(sentinel)
     }
 }
 
@@ -159,20 +150,12 @@ pub struct IterMut<T> {
     ongoing: bool,
 }
 impl<T> IterMut<T> {
-    /// Create a new iterator over a linked list.
-    /// ### Arguments:
-    /// * In the typical case of full list iteration, `start.prev` = `end`.
-    /// * `start` and `end` may be identical, in which case it will be yielded once.
-    /// * `start` and `end` may belong to different linked lists, this will result 
-    /// in an infinite iteration from both sides.
-    /// ### Safety:
-    /// `start`'s linked list must remain in a valid state during iteration.
-    /// Modifying `LlistNode`s already returned by the iterator is okay.
-    pub unsafe fn new(start: *mut LlistNode<T>, end: *mut LlistNode<T>) -> Self {
+    /// Create a new iterator over a linked list, *except* `sentinel`.
+    pub unsafe fn new(sentinel: *mut LlistNode<T>) -> Self {
         Self {
-            forward: start,
-            backward: end,
-            ongoing: true,
+            forward: (*sentinel).next.get(),
+            backward: (*sentinel).prev.get(),
+            ongoing: sentinel != (*sentinel).next.get(),
         }
     }
 }
@@ -208,4 +191,3 @@ impl<T> DoubleEndedIterator for IterMut<T> {
         }
     }
 }
-

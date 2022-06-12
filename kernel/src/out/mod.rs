@@ -1,6 +1,7 @@
 
 pub mod uart;
 pub mod framebuffer;
+pub mod terminal;
 
 // print! & println! implementations
 
@@ -22,7 +23,8 @@ pub fn __print(args: core::fmt::Arguments) {
     // todo: fix for firmware  (?)
     match uart::UART_COM1.0.try_lock() {
         Some(mut lock) => lock.write_fmt(args).unwrap(),
-        None => {},
+        None => (),
     }
-    // todo: framebuffer output
+    // fixme: framebuffer output
+    terminal::TERM1.lock().write_fmt(args).unwrap();
 }

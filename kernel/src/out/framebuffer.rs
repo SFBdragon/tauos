@@ -1,124 +1,130 @@
-// use core::marker::PhantomData;
 
 
+pub const RGBA: [usize; 4] = [0, 1, 2, 3];
+pub const BGRA: [usize; 4] = [2, 1, 0, 3];
+pub const ARGB: [usize; 4] = [3, 0, 1, 2];
+pub const ABGR: [usize; 4] = [3, 2, 1, 0];
 
-
-pub const PIXEL_WIDTH: usize = 4;
-
-/// Guarantees as per UEFI specification (EFI_PIXEL_BITMASK):
-/// 
-/// Bits in red, green, blue, and alpha masks must:
-/// * not overlap bit positions
-/// * represent the respective color intensities in an increasing fashion
-///     * no bits in mask set = lowest intensity
-///     * all bits in mask set = highest intensity
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameBufferBitmask {
-    red: u32,
-    green: u32,
-    blue: u32,
-    alpha: u32,
+pub enum PixelFormat {
+    RGBA,
+    BGRA,
+    ARGB,
+    ABGR,
 }
 
-impl FrameBufferBitmask {
-    pub const RGBA_COLOR_MASK: FrameBufferBitmask = FrameBufferBitmask {
-        red: 0x000000ff,
-        green: 0x0000ff00,
-        blue: 0x00ff0000,
-        alpha: 0xff000000,
-    };
-    
-    pub const BGRA_COLOR_MASK: FrameBufferBitmask = FrameBufferBitmask {
-        blue: 0x000000ff,
-        green: 0x0000ff00,
-        red: 0x00ff0000,
-        alpha: 0xff000000,
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+impl Color {
+    pub const WHITE: Self = Self::new(255, 255, 255, 255);
+    pub const BLACK: Self = Self::new(0, 0, 0, 0);
+
+    pub const fn new(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self { red, green, blue, alpha }
+    }
 }
 
-/* /// The possible pixel formats that may be used by a [`FrameBuffer`]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BufferPixelFormat {
-    /// 32-bit red-green-blue-alpha 8888 pixel, bytes ordered respectively.
-    Rgba,
-    /// 32-bit blue-green-red-alpha 8888 pixel, bytes ordered respectively.
-    Bgra,
-    /// 32-bit custom red, green, blue, alpha non-overlapping colour masks.
-    Bitmask,
-} */
+fn color_to_pixel(color: Color, format: PixelFormat) -> [u8; 4] {
+    match format {
+        PixelFormat::RGBA => [color.red, color.green, color.blue, color.alpha],
+        PixelFormat::BGRA => [color.blue, color.green, color.red, color.alpha],
+        PixelFormat::ARGB => [color.alpha, color.red, color.green, color.blue],
+        PixelFormat::ABGR => [color.alpha, color.blue, color.green, color.red],
+    }
+}
 
-/* impl From<uefi::proto::console::gop::PixelFormat> for BufferPixelFormat {
-    fn from(format: uefi::proto::console::gop::PixelFormat) -> Self {
-        match format {
-            uefi::proto::console::gop::PixelFormat::Bgr => BufferPixelFormat::Bgra,
-            uefi::proto::console::gop::PixelFormat::Rgb => BufferPixelFormat::Rgba,
-            uefi::proto::console::gop::PixelFormat::Bitmask => BufferPixelFormat::Bitmask,
-            uefi::proto::console::gop::PixelFormat::BltOnly => panic!("Cannot use BltOnly pixel format!"),
+pub struct FrameBuffer {
+    /// Frame buffer pointer.
+    pub buffer: *mut [u8],
+    /// Horizontal resolution in pixels.
+    pub width: usize,
+    /// Vertical resolution in pixels.
+    pub height: usize,
+    /// Scanline width in bytes.
+    pub stride: usize,
+    /// Internal pixel format.
+    pub format: PixelFormat,
+}
+
+impl FrameBuffer {
+    pub const unsafe fn new(base: *mut u8, width: usize, height: usize, stride: usize, format: PixelFormat) -> Self {
+        Self { buffer: core::ptr::slice_from_raw_parts_mut(base, stride * height), width, height, stride, format }
+    }
+
+
+    pub unsafe fn blt(&mut self, src: *const [u8], width: usize, height: usize, stride: usize, dst_x: usize, dst_y: usize) {
+        // todo fixme
+        for row in 0..height {
+            for col in 0..width {
+                let src_ptr = src.get_unchecked(col * 4 + row * stride);
+                let dst_ptr = self.buffer.get_unchecked_mut((dst_x + col) * 4 + (dst_y + row) * self.stride);
+                dst_ptr.cast::<[u8; 4]>().write(src_ptr.cast::<[u8; 4]>().read());
+            }
         }
     }
-} */
-
-
-/* #[derive(Debug)]
-struct FrameBuffer<'a> {
-    //base: *mut u8,
-    //slice: &'a mut [u32], // TODO: fix and settle
-    //mem: Option<alloc::boxed::Box<[u8]>>, // ?
-
-    /// Horizontal resolution in pixels
-    width: usize,
-    /// Vertical resolution in pixels
-    heigh: usize,
-    /// Scanline width in pixels - equal to or larger than `width`
-    stride: usize,
-
-    format: BufferPixelFormat,
-    bitmask: FrameBufferBitmask,
-    _temp: PhantomData<&'a mut u8>
-}
-
-impl<'a> FrameBuffer<'a> {
-    /// Create a [`FrameBuffer`] from the `base` pointer and current `ModeInfo` as per the UEFI specification
-    /// as a GRAPHICS_OUTPUT_PROTOCOL raw frame buffer.
-    pub fn from_uefi(base: *mut u8, info: uefi::proto::console::gop::ModeInfo) -> Self {
-        FrameBuffer { 
-            //slice: unsafe { core::mem::transmute(base) },
-            //mem: None,
-            width: info.resolution().0, 
-            heigh: info.resolution().1, 
-            stride: info.stride(), 
-            format: info.pixel_format().into(),
-            bitmask: match info.pixel_format().into() {
-                BufferPixelFormat::Rgba => FrameBufferBitmask::RGBA_COLOR_MASK,
-                BufferPixelFormat::Bgra => FrameBufferBitmask::BGRA_COLOR_MASK,
-                BufferPixelFormat::Bitmask => FrameBufferBitmask {
-                    red: info.pixel_bitmask().unwrap().red,
-                    green: info.pixel_bitmask().unwrap().green,
-                    blue: info.pixel_bitmask().unwrap().blue,
-                    alpha: info.pixel_bitmask().unwrap().reserved,
-                },
-            },
-            _temp: PhantomData,
+    pub unsafe fn internal_blt(&mut self, src_x: usize, src_y: usize, width: usize, height: usize, dst_x: usize, dst_y: usize) {
+        // todo fixme for left/right/top/bottom cases
+        for row in 0..height {
+            for col in 0..width {
+                let src_ptr = self.buffer.get_unchecked_mut((src_x + col) * 4 + (src_y + row) * self.stride);
+                let dst_ptr = self.buffer.get_unchecked_mut((dst_x + col) * 4 + (dst_y + row) * self.stride);
+                dst_ptr.cast::<[u8; 4]>().write(src_ptr.cast::<[u8; 4]>().read());
+            }
         }
     }
 
-    // TODO
+    /// ### Arguments:
+    /// * `offset` in bits from `src` to begin copy.
+    /// * `width` in bits of source bitmap; bits per row.
+    /// * `height` in rows.
+    /// * `stride` in bits of source bitmap; bits between rows.
+    /// * `dst_x` and `dst_y` the coordinates at which to write the bitmap to the framebuffer.
+    pub unsafe fn write_bitmap(&mut self, src: *const [u8], offset: usize, width: usize, height: usize, stride: usize,
+    dst_x: usize, dst_y: usize, dst_zero_color: Color, dst_one_color: Color) {
+        assert!(src.len() * 8 >= offset + stride * height - (stride - width));
+        assert!(dst_x + (width / 8) <= self.width);
+        assert!(dst_y + height <= self.height);
+        
+        let zero_pixel = color_to_pixel(dst_zero_color, self.format);
+        let one_pixel = color_to_pixel(dst_one_color, self.format);
 
-    ///// Create a new [`FrameBuffer`] that can act as a double-/triple-buffer by matching
-    ///// the source buffer's dimensions and pixel format. 
-    //pub fn double_buffer(&self) -> Self { }
+        for row in 0..height {
+            //let mut byte = *src.get_unchecked(offset / 8 + row * stride);
+            for col in 0..width {
+                let bit_offset = col + offset;
+                //if bit_offset % 8 == 0 { byte = *src.get_unchecked(bit_offset / 8 + row * stride); }
+                let pixel_ptr = self.buffer.get_unchecked_mut((dst_x + col) * 4 + (dst_y + row) * self.stride);
+                if *src.get_unchecked((bit_offset + row * stride) / 8) & 1 << (7 - bit_offset % 8) != 0 {
+                    pixel_ptr.cast::<[u8; 4]>().write(one_pixel);
+                } else {
+                    pixel_ptr.cast::<[u8; 4]>().write(zero_pixel);
+                }
+            }
+        }
+    }
 
-    //pub fn blt_entire(&self, other: &mut Self) { }
+    pub unsafe fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: Color) {
+        assert!(x + width <= self.width);
+        assert!(y + height <= self.height);
 
-    //pub fn blt(&mut self, block: ) { }
+        let pixel = color_to_pixel(color, self.format);
 
-    //pub fn write() {}
-    //pub fn read() {}
-} */
+        for row in y..(y + height) {
+            for col in 0..width {
+                self.buffer.get_unchecked_mut((x + col) * 4 + self.stride * row).cast::<[u8; 4]>().write(pixel);
+            }
+        }
+    }
+}
 
 
 
-
+/* 
 // --------------- PIXEL FORMAT CONVERSIONS ---------------- //
 
 
@@ -180,4 +186,4 @@ pub fn mask_to_bgra(pixels: &mut [u32], mask: FrameBufferBitmask) {
 }
 pub fn mask_to_mask(pixels: &mut [u32], from_mask: FrameBufferBitmask, to_mask: FrameBufferBitmask) {
     mask_format_conversion!(pixels, from_mask, to_mask);
-}
+} */

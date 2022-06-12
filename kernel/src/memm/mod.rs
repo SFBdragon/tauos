@@ -2,7 +2,7 @@
 
 pub mod talloc;
 
-use core::{mem, marker::PhantomData, ptr};
+use core::{marker::PhantomData, ptr};
 
 use amd64::{
     paging::{self, PTE, Pat, PatType},
@@ -23,9 +23,15 @@ pub const OFFSET_IDX: usize = 0o400;
 pub const PHYS_LADDR_OFFSET: isize = -0o400_000_000_000_0000;
 
 #[macro_export]
-macro_rules! from_phys {
+macro_rules! from_phys_addr {
     ($paddr:expr, $t:ty) => {
         ($paddr as isize + crate::memm::PHYS_LADDR_OFFSET) as *mut $t 
+    };
+}
+#[macro_export]
+macro_rules! to_phys_addr {
+    ($laddr:expr) => {
+        ($laddr as isize - crate::memm::PHYS_LADDR_OFFSET) as usize
     };
 }
 
@@ -41,7 +47,7 @@ sufficient space (128MiB away from BOOTBOOT mapped data) and yet remain
 within the topmost 1 GiB huge page (along with its stacks below it). */
 
 /// Kernel lower bound mapped virtual address.
-pub const KRNL_BOOT_BASE: usize = 0xffffffffC0000000 + paging::PTE_SIZE;
+pub const KRNL_BOOT_BASE: usize = 0usize.wrapping_sub(paging::PDPTE_SIZE);
 
 
 /// Acme of the topmost kernel stack (the bootstrap CPU).
@@ -91,9 +97,11 @@ pub const fn pat_type_to_pte(pat_type: PatType, is_hpage: bool) -> PTE {
 
 
 
-#[global_allocator]
-pub static mut ALLOCATOR: talloc::Tallock = unsafe { talloc::Tallock::new_invalid() };
 pub static MAPPER: Mutex<Mapper> = Mutex::new(unsafe { Mapper::new_invalid() });
+fn mapper_oom_handler(_: &mut Talloc, _: core::alloc::Layout)
+-> Result<(), core::alloc::AllocError> {
+    Err(core::alloc::AllocError)
+}
 
 
 
@@ -141,12 +149,12 @@ where F: FnMut(usize) -> usize {
             if !(*pte).contains(PTE::P) {
                 let page = page_getter(paging::PTE_SIZE);
                 // SAFETY: guaranteed by caller
-                crate::from_phys!(page, PTE).write_bytes(0, 512);
+                crate::from_phys_addr!(page, PTE).write_bytes(0, 512);
                 *pte = PTE::P | PTE::from_paddr(page as usize) | branches;
             }
             
             let lower_table = core::ptr::slice_from_raw_parts_mut(
-                crate::from_phys!((*pte).get_paddr(), PTE), 
+                crate::from_phys_addr!((*pte).get_paddr(), PTE), 
                 512
             );
 
@@ -181,7 +189,7 @@ mut paddr: usize, branches: PTE, leaves: PTE, table: *mut [PTE], page_getter: &m
 where F: FnMut() -> usize {
     use paging::{PML4_LVL, PDPT_LVL, PD_LVL, PT_LVL};
 
-    if LVL < PT_LVL || LVL > PML4_LVL { panic!("INVALID PAGE TABLE LVL") }
+    assert!(LVL < PT_LVL || LVL > PML4_LVL);
 
     // loop across the entries
     while (base as isize) < (acme as isize) {
@@ -209,12 +217,12 @@ where F: FnMut() -> usize {
             if !(*pte).contains(PTE::P) {
                 let page = page_getter();
                 // SAFETY: guaranteed by caller
-                crate::from_phys!(page, PTE).write_bytes(0, 512);
+                crate::from_phys_addr!(page, PTE).write_bytes(0, 512);
                 *pte = PTE::P | PTE::from_paddr(page) | branches;
             }
             
             let lower_table = core::ptr::slice_from_raw_parts_mut(
-                crate::from_phys!((*pte).get_paddr(), PTE), 
+                crate::from_phys_addr!((*pte).get_paddr(), PTE), 
                 512
             );
 
@@ -250,7 +258,7 @@ pub unsafe fn get_entry_offset(laddr: *mut u8, lvl: usize, pml4: *mut [PTE]) -> 
     while lvl_idx > lvl {
         let pte = *entry_ptr.wrapping_add(paging::table_index(entry_ptr, lvl_idx));
         crate::println!("pte {:?}", pte);
-        entry_ptr = from_phys!(pte.get_paddr(), PTE);
+        entry_ptr = from_phys_addr!(pte.get_paddr(), PTE);
         lvl_idx -= 1;
     }
     entry_ptr.wrapping_add(paging::table_index(laddr, lvl_idx))
@@ -271,7 +279,11 @@ pub struct Mapper {
 
 impl Mapper {
     const unsafe fn new_invalid() -> Self {
-        Self { krnl_pml4: 0,/*  mem_size: 0, */ talloc: talloc::Talloc::new_invalid() }
+        Self {
+            krnl_pml4: 0,
+            /*  mem_size: 0, */
+            talloc: Talloc::new_invalid(paging::PTE_SIZE, mapper_oom_handler)
+        }
     }
 
     // todo: document Mapper functions properly
@@ -282,7 +294,6 @@ impl Mapper {
     /// Safety: ident map
     pub unsafe fn setup<F: Iterator<Item = (usize, usize)> + Clone>(mmap: &F) -> usize {
         use amd64::paging::{PTE_SIZE, PDPTE_SIZE};
-        use crate::utils::llist::LlistNode;
 
         // The goal here is to get the physical memory manager working as quickly
         // as possible, mapping only the bare minimum. Mapping hereafter shall
@@ -378,37 +389,21 @@ impl Mapper {
 
         // ----- Setup physical memory allocator ----- //
 
-        // this talloc uses the physically offset mappings to access everything
-        // todo: this is subject to change?
-        let (llists_len, bitmap_len) = talloc::Talloc::slice_lengths(
-            hi_phys_addr, 
-            PTE_SIZE
-        );
-        let talloc_slices_ptr = page_getter() as isize + PHYS_LADDR_OFFSET;
-        let slices_bytes = llists_len * mem::size_of::<LlistNode<()>>() + bitmap_len;
-        // waste enough pages to cover the slices (one is already reserved)
-        page_getter_offset += (slices_bytes-1) & !(PTE_SIZE-1); 
-
-        let llists = core::ptr::slice_from_raw_parts_mut(
-            talloc_slices_ptr as *mut LlistNode<()>,
-            llists_len
-        );
-        let bitmap = core::ptr::slice_from_raw_parts_mut(
-            llists.as_mut_ptr().add(llists.len()) as *mut _,
-            bitmap_len
+        let free_mem = ptr::slice_from_raw_parts_mut(
+            from_phys_addr!(lgst_blk.0 + page_getter_offset, u8),
+            lgst_blk.1 - page_getter_offset
         );
         let mut talloc = talloc::Talloc::new(
-            PHYS_LADDR_OFFSET as *mut u8,
+            from_phys_addr!(PTE_SIZE, u8) as isize,
             hi_phys_addr,
             PTE_SIZE,
-            llists,
-            bitmap,
+            free_mem,
+            mapper_oom_handler,
         );
 
-        for (mut base, size) in mmap.clone() {
-            if base == lgst_blk.0 { base += page_getter_offset; }
-            let base = base as isize + PHYS_LADDR_OFFSET;
-            talloc.release(talloc.bound_available(base as *mut _, size));
+        for (base, size) in mmap.clone() {
+            if base == lgst_blk.0 { continue; }
+            talloc.release(ptr::slice_from_raw_parts_mut(from_phys_addr!(base, u8), size));
         }
 
         // set MAPPER
@@ -418,15 +413,19 @@ impl Mapper {
         CR3::read().paddr
     }
 
+    /// ### Safety:
+    /// Size must be nonzero.
     unsafe fn alloc_phys(&mut self, size: usize) -> usize {
-        self.talloc.alloc(size)
-            // todo: handle more gracefully?
-            .expect("Insufficient physical memory exception!")
-            .wrapping_offset(-PHYS_LADDR_OFFSET) as usize
+        to_phys_addr!(
+            self.talloc.alloc(core::alloc::Layout::from_size_align_unchecked(size, size))
+                // todo: handle more gracefully?
+                .expect("Out of physical memory exception!")
+                .as_ptr()
+        )
     }
 
     /// Maps base through acme to avaialable physical memory.
-    /// Safety:
+    /// ### Safety:
     /// * Any existing mappings within the span of virtual addresses will be remapped.
     /// * The specified PTEs must be valid and usable, and not contain an address.
     pub unsafe fn map(&mut self, base: *mut u8, size: usize,

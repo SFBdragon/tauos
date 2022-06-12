@@ -13,9 +13,9 @@ pub const KERNEL_GS_BASE: u32 = 0xC0000102;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct SegmentSelector(pub u16);
+pub struct SegSel(pub u16);
 
-impl SegmentSelector {
+impl SegSel {
     /// Requested Privilege Level mask
     pub const RPL_MASK: u16 = 0b11;
     /// Table index (selector): not set = GDT, set = LDT
@@ -24,15 +24,22 @@ impl SegmentSelector {
     /// Descriptor Table index mask
     pub const INDEX_MASK: u16 = 0b11111111_11111000;
 
-    pub fn new_gdt(rpl: PrivLvl, index: u16) -> Self {
-        SegmentSelector((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros()) 
+    pub const fn new_gdt(rpl: PrivLvl, index: u16) -> Self {
+        SegSel((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros()) 
     }
-    pub fn new_ldt(rpl: PrivLvl, index: u16) -> Self {
-        SegmentSelector((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros() | Self::TABLE_SELECTOR_BIT) 
+    pub const fn new_ldt(rpl: PrivLvl, index: u16) -> Self {
+        SegSel((rpl as u16) & Self::RPL_MASK | index << Self::INDEX_MASK.trailing_zeros() | Self::TABLE_SELECTOR_BIT) 
+    }
+
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+    pub const fn to_bits(self) -> u16 {
+        self.0
     }
 
     #[inline]
-    pub fn get_rpl(&self) -> PrivLvl {
+    pub const fn get_rpl(&self) -> PrivLvl {
         PrivLvl::from_bits((self.0 & Self::RPL_MASK) as u8)
     }
     #[inline]
@@ -41,7 +48,7 @@ impl SegmentSelector {
     }
 
     #[inline]
-    pub fn get_index(&self) -> u16 {
+    pub const fn get_index(&self) -> u16 {
         self.0 >> Self::INDEX_MASK.trailing_zeros()
     }
     #[inline]
@@ -51,7 +58,7 @@ impl SegmentSelector {
 
     /// Returns whether the selector indexes the Global Descriptor Table (`false`) or Local Descriptor Table (`true`).
     #[inline]
-    pub fn get_ti(&self) -> bool {
+    pub const fn get_ti(&self) -> bool {
         self.0 & Self::TABLE_SELECTOR_BIT == Self::TABLE_SELECTOR_BIT
     }
     /// Sets whether the selector indexes the Global Descriptor Table (`false`) or Local Descriptor Table (`true`).
@@ -64,53 +71,53 @@ impl SegmentSelector {
         }
     }
 }
-impl core::fmt::Debug for SegmentSelector {
+impl core::fmt::Debug for SegSel {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SegmentSelector")
-            .field("rpl", &self.get_rpl())
-            .field("ti", &self.get_ti())
-            .field("index", &self.get_index())
+            .field("required priveledge level", &self.get_rpl())
+            .field("ldt selector?", &self.get_ti())
+            .field("table index", &self.get_index())
             .finish()
     }
 }
 
 
-pub enum SegmentDescriptor {
+pub enum SegDesc {
     /// Code & Data descriptors
-    UserSegment(u64),
+    UserSeg(u64),
     /// System Descriptors - `(lo, hi)`
-    SystemSegment((u64, u64)),
+    SysSeg((u64, u64)),
 }
 
-impl SegmentDescriptor {
+impl SegDesc {
     /// Tries to find a slot to insert the descriptor, and if successful inserts it
     /// and returns the index at which the descriptor was inserted, else returns `Err(())`.
     pub fn try_insert_into_gdt(self, gdt: &mut [u64]) -> Result<usize, ()> {
         match self {
-            Self::UserSegment(seg) => {
+            Self::UserSeg(seg) => {
                 let mut index = 1;
 
                 while index < gdt.len() {
-                    let descriptor = unsafe { CodeSegmentDescriptor::from_bits_unchecked(gdt[index]) };
+                    let descriptor = unsafe { CodeSegDesc::from_bits_unchecked(gdt[index]) };
 
-                    if !descriptor.contains(CodeSegmentDescriptor::PRESENT) {
+                    if !descriptor.contains(CodeSegDesc::PRESENT) {
                         gdt[index] = seg; // unused segment, use it
                         return Ok(index)
-                    } else if !descriptor.contains(CodeSegmentDescriptor::TYPE) {
+                    } else if !descriptor.contains(CodeSegDesc::TYPE) {
                         index += 2; // system segment, skip "next" descriptor
                     } else {
                         index += 1; // user segment, check next
                     }
                 }
             },
-            Self::SystemSegment((seg_lo, seg_hi)) => {
+            Self::SysSeg((seg_lo, seg_hi)) => {
                 let mut index = 1;
                 let mut prev_avl = false;
 
                 while index < gdt.len() {
-                    let descriptor = unsafe { CodeSegmentDescriptor::from_bits_unchecked(gdt[index]) };
+                    let descriptor = unsafe { CodeSegDesc::from_bits_unchecked(gdt[index]) };
 
-                    if !descriptor.contains(CodeSegmentDescriptor::PRESENT) {
+                    if !descriptor.contains(CodeSegDesc::PRESENT) {
                         if prev_avl { // 2 unused segments; use them
                             gdt[index - 1] = seg_lo;
                             gdt[index - 0] = seg_hi;
@@ -118,7 +125,7 @@ impl SegmentDescriptor {
                         } else {
                             prev_avl = true; // unused segment; mark it
                         }
-                    } else if !descriptor.contains(CodeSegmentDescriptor::TYPE) {
+                    } else if !descriptor.contains(CodeSegDesc::TYPE) {
                         prev_avl = false;
                         index += 2; // system segment, skip "next" descriptor
                     } else {
@@ -137,7 +144,7 @@ bitflags::bitflags! {
     /// Code segment descriptor.
     /// 
     /// Limit, base, and various flags are ignored in non-compatibility long mode.
-    pub struct CodeSegmentDescriptor: u64 {
+    pub struct CodeSegDesc: u64 {
         /// Conforming flag:
         /// * set: code can be executed from any priviledge of a higher ring than described
         /// * clear: code can only be executed from the described ring
@@ -170,7 +177,7 @@ bitflags::bitflags! {
     /// Data segment descriptor.
     /// 
     /// Limit, base, and various flags are ignored in non-compatibility long mode.
-    pub struct DataSegmentDescriptor: u64 {
+    pub struct DataSegDesc: u64 {
 
         /// Should be clear. If clear, descriptor describes a data segment.
         const EXECUTABLE = 1 << 43;
@@ -183,26 +190,27 @@ bitflags::bitflags! {
     }
 }
 
-impl Default for CodeSegmentDescriptor {
-    /// Sets `CONFORMING`, `EXECUTABLE`, `TYPE`, `PRESENT`, `PRIVILEDGE_RING0`, and `LONG_MODE`.
+impl Default for CodeSegDesc {
+    /// Sets `CONFORMING`, `EXECUTABLE`, `TYPE`, `PRESENT`, and `LONG_MODE`.
+    /// 
+    /// Implicitly DPL 0.
     fn default() -> Self {
         Self { 
-            bits: (CodeSegmentDescriptor::CONFORMING
-                | CodeSegmentDescriptor::EXECUTABLE
-                | CodeSegmentDescriptor::TYPE
-                | CodeSegmentDescriptor::PRESENT
-                | CodeSegmentDescriptor::DPL_RING0
-                | CodeSegmentDescriptor::LONG_MODE
+            bits: (CodeSegDesc::CONFORMING
+                | CodeSegDesc::EXECUTABLE
+                | CodeSegDesc::TYPE
+                | CodeSegDesc::PRESENT
+                | CodeSegDesc::LONG_MODE
             ).bits
         }
     }
 }
-impl Default for DataSegmentDescriptor {
+impl Default for DataSegDesc {
     /// Sets `TYPE` and `PRESENT`.
     fn default() -> Self {
         Self { 
-            bits: (DataSegmentDescriptor::TYPE
-                | DataSegmentDescriptor::PRESENT
+            bits: (DataSegDesc::TYPE
+                | DataSegDesc::PRESENT
             ).bits
         }
     }
@@ -211,7 +219,7 @@ impl Default for DataSegmentDescriptor {
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
-pub struct SystemSegmentDescriptor {
+pub struct SysSegDesc {
     limit_lo: u16,
     base_lo: u16,
     base_mid_0: u8,
@@ -230,33 +238,31 @@ pub struct SystemSegmentDescriptor {
     base_hi: u32,
     reserved: u32,
 }
-impl SystemSegmentDescriptor {
+impl SysSegDesc {
     const FLAG_PRESENT: u8 = 0b1000_0000;
     const DPL_MASK: u8 = 0b0110_0000;
     const SSDT_MASK: u8 = 0b0000_1111;
     const GRANULARITY: u8 = 0b1000_0000;
     const LIMIT_MASK: u8 = 0b0000_1111;
 
-    pub fn new(base_laddr: u64, limit: u32, ssdt: Ssdt, priviledge: PrivLvl, page_granularity_limit: bool) -> Self {
-        SystemSegmentDescriptor {
+    pub fn new(base: *mut u8, limit: u32, ssdt: Ssdt, priviledge: PrivLvl, page_granularity_limit: bool) -> Self {
+        SysSegDesc {
             limit_lo: limit as u16,
-            base_lo: base_laddr as u16,
-            base_mid_0: (base_laddr >> 16) as u8,
+            base_lo: base.to_bits() as u16,
+            base_mid_0: (base.to_bits() >> 16) as u8,
             flags: ssdt as u8 | (priviledge as u8) << 5 | 0b1000_0000,
             g_limit_hi: ((limit >> 16) & 0b111) as u8 | (page_granularity_limit as u8) << 7,
-            base_mid_1: (base_laddr >> 24) as u8,
-            base_hi: (base_laddr >> 32) as u32,
+            base_mid_1: (base.to_bits() >> 24) as u8,
+            base_hi: (base.to_bits() >> 32) as u32,
             reserved: 0,
         }
     }
 
-    pub fn into_u64(&self) -> (u64, u64) {
-        // Safety: SystemDescriptorTable is repr(align(8))
-        // This is more easily, verifiably safe than shifting all values by hand
-        let ptr = self as *const _ as *const u64;
-        unsafe {
-            (*ptr, *ptr.offset(1))
-        }
+    pub fn to_bits(&self) -> [u64; 2] {
+        unsafe { core::mem::transmute_copy(self) }
+    }
+    pub unsafe fn from_bits_unchecked(bits: [u64; 2]) -> Self {
+        core::mem::transmute(bits)
     }
 
     #[inline]
@@ -331,7 +337,7 @@ impl SystemSegmentDescriptor {
         }
     }
 }
-impl core::fmt::Debug for SystemSegmentDescriptor {
+impl core::fmt::Debug for SysSegDesc {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SystemSegmentDescriptor")
             .field("base linear address", &self.get_base())
@@ -343,7 +349,7 @@ impl core::fmt::Debug for SystemSegmentDescriptor {
             .finish()
     }
 }
-impl PartialEq for SystemSegmentDescriptor {
+impl PartialEq for SysSegDesc {
     fn eq(&self, other: &Self) -> bool {
         self.limit_lo == other.limit_lo
         && self.base_lo == other.base_lo
@@ -354,19 +360,40 @@ impl PartialEq for SystemSegmentDescriptor {
         && self.base_hi == other.base_hi
     }
 }
-impl Eq for SystemSegmentDescriptor { }
+impl Eq for SysSegDesc { }
 
 
+/// Task State Segment without an IOPB.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaskStateSegment {
-    pub reserved_0: u32,
-    pub rsp_table: [u64; 3],
-    pub reserved_1: u64,
-    pub ist_table: [u64; 7],
-    pub reserved_2: u64,
-    pub reserved_3: u16,
-    pub iobp: u16,
+pub struct TaskStateSeg {
+    reserved_0: u32,
+    /// Stack Pointers 0 through 2.
+    pub rsp_table: [*mut u8; 3],
+    reserved_1: u64,
+    /// Interrupt Stack Tables 1 through 7.
+    pub ist_table: [*mut u8; 7],
+    reserved_2: u64,
+    reserved_3: u16,
+    io_map_base_offset: u16,
+}
+
+impl TaskStateSeg {
+    pub const LIMIT: u32 = 104 - 1;
+
+    pub const fn new(rsp_table: [*mut u8; 3], ist_table: [*mut u8; 7]) -> Self {
+        Self {
+            reserved_0: 0,
+            rsp_table,
+            reserved_1: 0,
+            ist_table,
+            reserved_2: 0,
+            reserved_3: 0,
+            // this results in iopb being effectively disabled
+            // as well as being compliant with Intel CPUs (hence not 0xffff?)
+            io_map_base_offset: 0xdfff,
+        }
+    }
 }
 
 
@@ -380,14 +407,14 @@ pub(crate) struct DescriptorTableOp {
 /// Load Global Descriptor Table (write to GDTR). 
 /// 
 /// *Does not refresh segment registers.*
-/// # Safety
 /// 
+/// ### Safety:
 /// Caller must ensure that:
-/// * `gdt` points to the base of a valid GDT in memory 
-/// * setting GDTR using `gdt` won't cause memory safety violations
-/// * `gdt` remains in memory at least as long as it is loaded in the GDTR
-pub unsafe fn lgdt(gdt: &mut [u64]) {
-    lgdt_raw((gdt.len() * size_of::<u64>() - 1) as u16, gdt.as_mut_ptr());
+/// * `gdt` points to the base of a valid GDT in memory .
+/// * Setting GDTR using `gdt` won't cause memory safety violations.
+/// * `gdt` remains in memory at least as long as it is loaded in the GDTR.
+pub unsafe fn lgdt(gdt: *mut [u64]) {
+    lgdt_raw(((*gdt).len() * size_of::<u64>() - 1) as u16, gdt.as_mut_ptr());
 }
 /// Load Global Descriptor Table (write to GDTR). 
 /// 
@@ -401,7 +428,7 @@ pub unsafe fn lgdt(gdt: &mut [u64]) {
 /// * `gdt` points to the base of a valid GDT in memory 
 /// * setting GDTR using `gdt` won't cause memory safety violations
 /// * `gdt` remains in memory at least as long as it is loaded in the GDTR
-pub unsafe fn lgdt_raw(limit: u16, base: *const u64) {
+pub unsafe fn lgdt_raw(limit: u16, base: *mut u64) {
     let dto = DescriptorTableOp { limit, base: base as u64 };
     asm!("lgdt [{}]", in(reg) &dto, options(readonly, nostack, preserves_flags));
 }
@@ -428,6 +455,17 @@ pub fn sgdt_raw() -> (u16, *mut u64) {
     (dto.limit, dto.base as *mut _)
 }
 
+pub unsafe fn ltr(selector: SegSel) {
+    asm!("ltr {:x}", in(reg) selector.to_bits(), options(nomem, nostack, preserves_flags));
+}
+pub fn str() -> SegSel {
+    let mut selector: u16;
+    unsafe {
+        asm!("str {:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
+    }
+    SegSel::from_bits(selector)
+}
+
 pub fn cs_read() -> u16 {
     let cs: u16;
     unsafe {
@@ -437,7 +475,7 @@ pub fn cs_read() -> u16 {
 }
 /// # Safety:
 /// Ensure selector is a valid and correctly priviledged code segment.
-pub unsafe fn cs_write(selector: SegmentSelector) {
+pub unsafe fn cs_write(selector: SegSel) {
     asm!(
         "push {0}",            // push selector word
         "lea {1}, [rip + 2f]", // calcuate return instruction address
@@ -458,7 +496,7 @@ pub fn fs_read() -> u16 {
 }
 /// # Safety:
 /// Ensure selector is a valid and correctly priviledged data segment.
-pub unsafe fn fs_write(selector: SegmentSelector) {
+pub unsafe fn fs_write(selector: SegSel) {
     asm!("mov fs, {:x}", in(reg) selector.0, options(nostack, preserves_flags));
 }
 pub fn gs_read() -> u16 {
@@ -470,7 +508,7 @@ pub fn gs_read() -> u16 {
 }
 /// # Safety:
 /// Ensure selector is a valid and correctly priviledged data segment.
-pub unsafe fn gs_write(selector: SegmentSelector) {
+pub unsafe fn gs_write(selector: SegSel) {
     asm!("mov gs, {:x}", in(reg) selector.0, options(nostack, preserves_flags));
 }
 

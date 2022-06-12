@@ -1,6 +1,6 @@
-use core::{marker::PhantomData, fmt::Debug, panic, mem::{MaybeUninit, size_of}};
+use core::{marker::PhantomData, fmt::Debug, mem::{MaybeUninit, size_of}};
 
-use super::{segmentation::{DescriptorTableOp, SegmentSelector}, PrivLvl};
+use super::{segmentation::{DescriptorTableOp, SegSel}, PrivLvl};
 
 
 // ERROR CODES
@@ -145,12 +145,8 @@ pub struct IntTrapGate<F> {
 impl<F> IntTrapGate<F> {
     /// # Arguments
     /// * `ssdt`: `ssdt` must be either `Ssdt::InterruptGate` or `Ssdt::TrapGate`.
-    pub fn missing(ssdt: Ssdt) -> Self {
-        match ssdt {
-            Ssdt::InterruptGate => (),
-            Ssdt::TrapGate => (),
-            _ => panic!("Invalid system-segment descriptor type for a gate descriptor: {:?}. Expected Interrupt or Trap", ssdt),
-        }
+    pub const fn missing(ssdt: Ssdt) -> Self {
+        assert!(matches!(ssdt, Ssdt::InterruptGate | Ssdt::TrapGate));
 
         IntTrapGate {
             isr_ptr_lo: 0,
@@ -167,15 +163,9 @@ impl<F> IntTrapGate<F> {
     /// # Arguments
     /// * `ssdt`: `ssdt` must be either `Ssdt::InterruptGate` or `Ssdt::TrapGate`.
     /// * `ist`: `ist` (Interrupt Stack Table index) must be less than 8.
-    pub fn new(target_laddr: u64, selector: SegmentSelector, ist: u8, ssdt: Ssdt, priviledge: PrivLvl) -> Self {
-        match ssdt {
-            Ssdt::InterruptGate => (),
-            Ssdt::TrapGate => (),
-            _ => panic!("Invalid system-segment descriptor type for a gate descriptor: {:?}. Expected Interrupt or Trap", ssdt),
-        }
-        if ist > 7 {
-            panic!("Interrupt Stack Table index (IST) must be between 0 and 7 inclusive, instead was {}.", ist);
-        }
+    pub const fn new(target_laddr: u64, selector: SegSel, ist: u8, ssdt: Ssdt, priviledge: PrivLvl) -> Self {
+        assert!(ist < 8);
+        assert!(matches!(ssdt, Ssdt::InterruptGate | Ssdt::TrapGate));
 
         IntTrapGate {
             isr_ptr_lo: target_laddr as u16,
@@ -208,9 +198,7 @@ impl<F> IntTrapGate<F> {
     /// * `ist`: `ist` (Interrupt Stack Table index) must be less than 8.
     #[inline]
     pub fn set_ist(&mut self, ist: u8) {
-        if ist > 7 {
-            panic!("Interrupt Stack Table index (IST) must be between 0 and 7 inclusive, instead was {}.", ist);
-        }
+        assert!(ist < 8);
         self.ist = ist;
     } 
 
@@ -222,11 +210,7 @@ impl<F> IntTrapGate<F> {
     /// * `ssdt`: `ssdt` must be either `Ssdt::InterruptGate` or `Ssdt::TrapGate`.
     #[inline]
     pub fn set_ssdt(&mut self, ssdt: Ssdt) {
-        match ssdt {
-            Ssdt::InterruptGate => (),
-            Ssdt::TrapGate => (),
-            _ => panic!("Invalid system-segment descriptor type for a gate descriptor: {:?}. Expected Interrupt or Trap", ssdt),
-        }
+        assert!(matches!(ssdt, Ssdt::InterruptGate | Ssdt::TrapGate));
         self.flags = self.flags & !GATE_SSDT_MASK | ssdt as u8;
     } 
 
@@ -315,7 +299,7 @@ impl<F> CallGate<F> {
         }
     }
 
-    pub fn new(target_laddr: u64, selector: SegmentSelector, priviledge: PrivLvl) -> Self {
+    pub fn new(target_laddr: u64, selector: SegSel, priviledge: PrivLvl) -> Self {
         CallGate {
             isr_ptr_lo: target_laddr as u16,
             selector: selector.0,
@@ -385,19 +369,39 @@ impl<F> Eq for CallGate<F> { }
 
 // IDT
 
-#[repr(C, align(16))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The stack frame of long mode interrupts.
+/// 
+/// Safety: Modifying the contents of an interrupt's stack frame is UB.
+#[derive(Clone, Copy)]
+#[repr(C)]
 pub struct InterruptStackFrame {
-    pub ss: u64,
-    pub rsp: u64,
-    pub rflags: u64,
-    pub cs: u64,
+    /// Instruction pointer.
     pub rip: u64,
+    /// Code segment.
+    pub cs: u64,
+    /// CPU flags.
+    pub rflags: u64,
+    /// Stack pointer.
+    pub rsp: u64,
+    /// Stack segment.
+    pub ss: u64,
+}
+impl Debug for InterruptStackFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let rflags = unsafe { crate::registers::RFLAGS::from_bits_unchecked(self.rflags) };
+        f.debug_struct("InterruptStackFrame")
+            .field("rip", &format_args!("{:#x}", self.rip))
+            .field("rflags", &format_args!("{:?}", rflags))
+            .field("rsp", &format_args!("{:#x}", self.rsp))
+            .field("code segment", &SegSel::from_bits(self.cs as u16))
+            .field("stack segment", &SegSel::from_bits(self.ss as u16))
+            .finish()
+    }
 }
 
-pub type Handler = extern "x86-interrupt" fn(InterruptStackFrame);
-pub type HandlerWithErrCode = extern "x86-interrupt" fn(InterruptStackFrame, u64);
-pub type DivergingHandlerWithErrCode = extern "x86-interrupt" fn(InterruptStackFrame, u64) -> !;
+pub type ISR = extern "x86-interrupt" fn(InterruptStackFrame);
+pub type ISRwErrCode = extern "x86-interrupt" fn(InterruptStackFrame, u64);
+pub type DivISRwErrCode = extern "x86-interrupt" fn(InterruptStackFrame, u64) -> !;
 
 /// Interrupt Descriptor Table (IDT)
 /// 
@@ -405,84 +409,84 @@ pub type DivergingHandlerWithErrCode = extern "x86-interrupt" fn(InterruptStackF
 /// 
 /// Program restart flavours: Faults return to the executed instruction, traps to the following instruction, 
 /// aborts might diverge. This is denoted with the suffix `_fault`, `_trap`, `_abort`, or none where 'it's complicated'.
-#[repr(C, packed)]
-pub struct InterruptDesciptorTable {
-
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct IDT {
     /// 0 Divide-by-Zero-Error #DE DIV, IDIV, AAM instructions
-    pub div_by_zero_fault: IntTrapGate<Handler>,
+    pub div_by_zero_fault: IntTrapGate<ISR>,
 
     /// 1 Debug #DB Instruction accesses and data accesses
     /// 
     /// #DB information is returned in the debug-status register, DR6.
-    pub debug: IntTrapGate<Handler>,
+    pub debug: IntTrapGate<ISR>,
 
     /// 2 Non-Maskable-Interrupt #NMI External NMI signal
-    pub non_maskable_interrupt: IntTrapGate<Handler>,
+    pub non_maskable_interrupt: IntTrapGate<ISR>,
 
     /// 3 Breakpoint #BP INT3 instruction
-    pub break_point_trap: IntTrapGate<Handler>,
+    pub break_point_trap: IntTrapGate<ISR>,
 
     /// 4 Overflow #OF INTO instruction
-    pub overflow_trap: IntTrapGate<Handler>,
+    pub overflow_trap: IntTrapGate<ISR>,
 
     /// 5 Bound-Range #BR BOUND instruction
-    pub bound_range_fault: IntTrapGate<Handler>,
+    pub bound_range_fault: IntTrapGate<ISR>,
 
     /// 6 Invalid-Opcode #UD Invalid instructions
-    pub invalid_opcode_fault: IntTrapGate<Handler>,
+    pub invalid_opcode_fault: IntTrapGate<ISR>,
 
     /// 7 Device-Not-Available #NM x87 instructions
-    pub device_not_available_fault: IntTrapGate<Handler>,
+    pub device_not_available_fault: IntTrapGate<ISR>,
 
     /// 8 Double-Fault #DF Exception during the handling of another exception or interrupt [async]
     /// 
     /// Error code: zero.
-    pub double_fault_abort: IntTrapGate<DivergingHandlerWithErrCode>,
+    pub double_fault_abort: IntTrapGate<DivISRwErrCode>,
 
     /// 9 Coprocessor-Segment-Overrun — Unsupported (Reserved)
-    pub reserved_0: u128,
+    reserved_0: u128,
 
     /// 10 Invalid-TSS #TS Task-state segment access and task switch
     /// 
     /// Error code: a segment selector index.
-    pub invalid_tss_fault: IntTrapGate<HandlerWithErrCode>,
+    pub invalid_tss_fault: IntTrapGate<ISRwErrCode>,
 
     /// 11 Segment-Not-Present #NP Segment register loads
     /// 
     /// Error code: the messing segment index.
-    pub segment_not_present_fault: IntTrapGate<HandlerWithErrCode>,
+    pub segment_not_present_fault: IntTrapGate<ISRwErrCode>,
 
     /// 12 Stack #SS SS register loads and stack references
     /// 
     /// Error code: zero or stack segment selector index.
-    pub stack_fault: IntTrapGate<HandlerWithErrCode>,
+    pub stack_fault: IntTrapGate<ISRwErrCode>,
 
     /// 13 General-Protection #GP Memory accesses and protection checks
     /// 
     /// Error code: selector index or zero.
-    pub general_protection_fault: IntTrapGate<HandlerWithErrCode>,
+    pub general_protection_fault: IntTrapGate<ISRwErrCode>,
 
     /// 14 Page-Fault #PF Memory accesses when paging enabled
     /// 
     /// Error code: `PageFaultErrCodeFlags`
     /// 
     /// The faulting linear address is stored in CR2.
-    pub page_fault: IntTrapGate<HandlerWithErrCode>,
+    pub page_fault: IntTrapGate<ISRwErrCode>,
 
     /// 15 Reserved —
-    pub reserved_1: u128,
+    reserved_1: u128,
 
     /// 16 x87 Floating-Point Exception Pending #MF x87 floating-point instructions [async]
     /// 
     /// Unused in 64-bit long mode.
     /// 
     /// Exception information is provided by the x87 status-word register.
-    pub x87_fp_fault: IntTrapGate<Handler>,
+    pub x87_fp_fault: IntTrapGate<ISR>,
 
     /// 17 Alignment-Check #AC Misaligned memory accesses
     /// 
     /// Error code: zero.
-    pub alignment_check_fault: IntTrapGate<HandlerWithErrCode>,
+    pub alignment_check_fault: IntTrapGate<ISRwErrCode>,
 
     /// 18 Machine-Check #MC Model specific [async]
     /// 
@@ -491,38 +495,80 @@ pub struct InterruptDesciptorTable {
     /// If RIPV is clear, there is no reliable way to restart the program.
     /// 
     /// Error information is provided by model-specific registers (MSRs) defined by the machine-check architecture.
-    pub machine_check_abort: IntTrapGate<Handler>,
+    pub machine_check_abort: IntTrapGate<ISR>,
 
     /// 19 SIMD Floating-Point #XF SSE floating-point instructions
     /// 
     /// Exception information is provided by the SSE floating-point MXCSR register.
-    pub simd_fp_fault: IntTrapGate<Handler>,
+    pub simd_fp_fault: IntTrapGate<ISR>,
     
     /// 20 Reserved —
-    pub reserved_2: u128,
+    reserved_2: u128,
 
     /// 21 Control-Protection Exception #CP RET/IRET or other control transfer
     /// 
     /// Error code: `ControlProtectionErrCode`.
-    pub control_protection_fault: IntTrapGate<HandlerWithErrCode>,
+    pub control_protection_fault: IntTrapGate<ISRwErrCode>,
 
     /// 22–27 Reserved —
-    pub reserved_3: [u128; 6],
+    reserved_3: [u128; 6],
     
     /// 28 Hypervisor Injection Exception #HV Event injection
-    pub hypervisor_injection: IntTrapGate<HandlerWithErrCode>,
+    pub hypervisor_injection: IntTrapGate<ISRwErrCode>,
     /// 29 VMM Communication Exception #VC Virtualization event
-    pub vmm_communication_fault: IntTrapGate<HandlerWithErrCode>,
+    pub vmm_communication_fault: IntTrapGate<ISRwErrCode>,
     /// 30 Security Exception #SX Security-sensitive event in host
-    pub security: IntTrapGate<HandlerWithErrCode>,
+    pub security: IntTrapGate<ISRwErrCode>,
 
     /// 31 Reserved —
-    pub reserved_4: u128,
+    reserved_4: u128,
 
     /// 32-255 Available
-    pub interrupts: [IntTrapGate<Handler>; 224],
+    pub interrupts: [IntTrapGate<ISR>; 224],
 }
 
+impl IDT {
+    pub const fn empty() -> Self {
+        Self {
+            div_by_zero_fault:          IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            debug:                      IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            non_maskable_interrupt:     IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            break_point_trap:           IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            overflow_trap:              IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            bound_range_fault:          IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            invalid_opcode_fault:       IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            device_not_available_fault: IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            double_fault_abort:         IntTrapGate::<DivISRwErrCode>::missing(Ssdt::InterruptGate),
+            reserved_0:                 0,
+            invalid_tss_fault:          IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            segment_not_present_fault:  IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            stack_fault:                IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            general_protection_fault:   IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            page_fault:                 IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            reserved_1:                 0,
+            x87_fp_fault:               IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            alignment_check_fault:      IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            machine_check_abort:        IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            simd_fp_fault:              IntTrapGate::<ISR>::missing(Ssdt::InterruptGate),
+            reserved_2:                 0,
+            control_protection_fault:   IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            reserved_3:                 [0; 6],
+            hypervisor_injection:       IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            vmm_communication_fault:    IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            security:                   IntTrapGate::<ISRwErrCode>::missing(Ssdt::InterruptGate),
+            reserved_4:                 0,
+            interrupts:                 [IntTrapGate::<ISR>::missing(Ssdt::InterruptGate); 224],
+        }
+    }
+}
+
+/* impl Index for IDT {
+    type Output = IntTrapGate<>;
+
+    fn index(&self, index: Idx) -> &Self::Output {
+        todo!()
+    }
+} */
 
 // TODO: NMI handler - check if between a sti and a hlt, and inc IP if so
 
@@ -550,8 +596,8 @@ pub fn sti_hlt() {
 /// Load Interrupt Descriptor Table into IDTR
 /// # Safety:
 /// Caller must ensure loading this IDT is safe.
-pub unsafe fn lidt(idt: *const InterruptDesciptorTable) {
-    lidt_raw(size_of::<InterruptDesciptorTable>() as u16 - 1, idt)
+pub unsafe fn lidt(idt: *const IDT) {
+    lidt_raw(size_of::<IDT>() as u16 - 1, idt)
 }
 /// Load Interrupt Descriptor Table into IDTR
 /// # Arguments
@@ -563,13 +609,13 @@ pub unsafe fn lidt(idt: *const InterruptDesciptorTable) {
 /// * `base` points to the base of an IDT in memory
 /// * `limit` is accurate
 /// * loading this IDT is safe
-pub unsafe fn lidt_raw(limit: u16, base: *const InterruptDesciptorTable) {
+pub unsafe fn lidt_raw(limit: u16, base: *const IDT) {
     let dto = DescriptorTableOp { limit, base: base as u64 };
     core::arch::asm!("lidt [{}]", in(reg) &dto, options(readonly, nostack, preserves_flags));
 }
 
 /// Store Interrupt Descriptor Table (read from IDTR)
-pub fn sidt<'a>() -> &'a mut InterruptDesciptorTable {
+pub fn sidt<'a>() -> &'a mut IDT {
     let (_, base) = sidt_raw();
     unsafe {
         base.as_mut().unwrap()
@@ -579,7 +625,7 @@ pub fn sidt<'a>() -> &'a mut InterruptDesciptorTable {
 /// # Returns
 /// * 0: the size of the table in bytes minus 1
 /// * 1: the linear (paged) address of the table
-pub fn sidt_raw() -> (u16, *mut InterruptDesciptorTable) {
+pub fn sidt_raw() -> (u16, *mut IDT) {
     let mut dto: MaybeUninit<DescriptorTableOp> = MaybeUninit::uninit();
 
     unsafe {
@@ -591,14 +637,14 @@ pub fn sidt_raw() -> (u16, *mut InterruptDesciptorTable) {
 }
 
 /// Load Task Register
-pub unsafe fn ltr(selector: SegmentSelector) {
+pub unsafe fn ltr(selector: SegSel) {
     core::arch::asm!("ltr {:x}", in(reg) selector.0, options(nomem, nostack, preserves_flags));
 }
 /// Store Task Register
-pub fn str() -> SegmentSelector {
+pub fn str() -> SegSel {
     let selector: u16;
     unsafe {
         core::arch::asm!("ltr {:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
     }
-    SegmentSelector(selector)
+    SegSel(selector)
 }
