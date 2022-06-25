@@ -376,23 +376,22 @@ impl<F> Eq for CallGate<F> { }
 #[repr(C)]
 pub struct InterruptStackFrame {
     /// Instruction pointer.
-    pub rip: u64,
+    pub rip: *const u8,
     /// Code segment.
     pub cs: u64,
     /// CPU flags.
-    pub rflags: u64,
+    pub rflags: crate::registers::RFLAGS,
     /// Stack pointer.
-    pub rsp: u64,
+    pub rsp: *const u8,
     /// Stack segment.
     pub ss: u64,
 }
 impl Debug for InterruptStackFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let rflags = unsafe { crate::registers::RFLAGS::from_bits_unchecked(self.rflags) };
         f.debug_struct("InterruptStackFrame")
-            .field("rip", &format_args!("{:#x}", self.rip))
-            .field("rflags", &format_args!("{:?}", rflags))
-            .field("rsp", &format_args!("{:#x}", self.rsp))
+            .field("rip", &format_args!("{:#p}", self.rip))
+            .field("rflags", &format_args!("{:?}", self.rflags))
+            .field("rsp", &format_args!("{:#p}", self.rsp))
             .field("code segment", &SegSel::from_bits(self.cs as u16))
             .field("stack segment", &SegSel::from_bits(self.ss as u16))
             .finish()

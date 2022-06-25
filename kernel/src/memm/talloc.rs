@@ -31,10 +31,8 @@ type OomHandler = fn(&mut Talloc, Layout) -> Result<(), AllocError>;
 /// 
 /// ### Allocator design:
 /// * **O(log n)** worst case allocation and deallocation performance.
-/// * **O(2^n)** memory usage, at most `arena size / 128 + k`, where k is small.
-/// * **buddy allocation** thus will *always* allocate in powers of two.
-/// * **linked free-lists** the headers' slice must be stored seperately.
-/// * **bitmap**: the bitmap slice must be stored seperately.
+/// * **O(2^n)** amortized memory usage, at most `arena size / 128 + k`.
+/// * **buddy allocation** + **linked free-lists** + **bitmap**
 /// 
 /// Note that the extra slices can be stored within the arena, 
 /// as long as they remain reserved.
@@ -60,7 +58,7 @@ pub struct Talloc {
     /// 
     /// Bitfield of length `1 << llists.len()` in bits, where each granularity has a bit for each buddy,
     /// offset from the base by that width in bits. Where digits represent each bit for a certain
-    /// granularity: `01223333_44444444_55555555_55555555_6...` and so on. Buddies are represented from
+    /// granularity: `01223333_44444444_55555555_55555555_6...`. Buddies are represented from
     /// low addresses to high addresses.
     /// * Clear bit indicates homogeneity: both or neither are allocated.
     /// * Set bit indicated heterogeneity: one buddy is allocated.
@@ -180,8 +178,8 @@ impl Talloc {
     }
     /// Unregisters a block from the free list, reserving it against allocation.
     /// 
-    /// To reserve a block from the linked list directly (which this API does not allow),
-    /// consider instead using `remove_block_next(...)`.
+    /// To reserve a block from the linked list directly (which this API doesn't allow),
+    /// consider instead using `Talloc::remove_block_next`.
     /// ### Safety:
     /// * `bitmap_offset`'s source `size` and `position` must agree with
     /// `granularity`'s corresponding block size and `node`'s block base and size.
@@ -368,7 +366,7 @@ impl Talloc {
     /// Address-space wraparound is allowed, but `null` block will not be released.
     /// ### Safety:
     /// * `mem` must be reserved (unallocatable).
-    /// * `mem` must be safely readable and writable.
+    /// * `mem` must be readable and writable.
     pub unsafe fn release(&mut self, mem: *mut [u8]) {
         let sbm1 = self.smlst_block as isize - 1;
         let base = mem.as_mut_ptr() as isize + sbm1 & !sbm1;
@@ -391,7 +389,7 @@ impl Talloc {
 
         // Strategy:
         // - Start address at the base of the bounds
-        // - Allocate as large a block as possible repeatedly for the given alignment, bump address
+        // - Repeatedly allocate as large a block as possible for the given alignment, bump address
         // -    Do so until adding a larger block would overflow the top bound
         // - Allocate the previous power of two of the delta between current address and top + smlst, bump address
         // - When the delta is zero, the bounds have been entirely filled

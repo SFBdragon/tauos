@@ -15,9 +15,11 @@ pub struct PsfFontHeader {
     pub glyph_count: u32,
     /// Bytes per glyph.
     pub glyph_size: u32,
-    /// Glyph height in pixels/bits.
+    /// Glyph height in pixels.
     pub height: u32,
-    /// Glyph width in pixels/bits.
+    /// Glyph width in pixels.
+    /// 
+    /// Bit width is `width` rounded to the next byte.
     pub width: u32,
 }
 

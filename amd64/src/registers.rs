@@ -9,6 +9,7 @@ pub const APERF_MSR: u64 =     0xC00000E8;
 
 
 bitflags::bitflags! {
+    #[repr(transparent)]
     pub struct RFLAGS: u64 {
         /// Carry Flag
         const CF = 1 << 0;

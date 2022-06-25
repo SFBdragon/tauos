@@ -138,13 +138,18 @@ fn init() -> ! {
     let (gdt, idt, tss) = unsafe { setup_sys_tables(talloc.as_ref()) };
 
     if thread_ticket == 0 {
+        /* println!("sizeof inttrapgate: {}", core::mem::size_of::<IntTrapGate<interrupts::ISR>>());
+        println!("sizeof idt: {}", core::mem::size_of::<[IntTrapGate<interrupts::ISR>; 256]>());
+        println!("sizeof idt: {}", core::mem::size_of::<IDT>()); */
+        // ISRs with error codes are breaking!
         unsafe { core::arch::asm!("int3"); }
+        //unsafe { core::arch::asm!("mov rcx, 0", "div rcx"); }
         unsafe { core::arch::asm!("nop"); }
-        unsafe { core::arch::asm!("nop"); }
-        unsafe { core::arch::asm!("nop"); }
-        //unsafe { core::arch::asm!("int 13"); }
-        unsafe { core::arch::asm!("mov [48879], eax"); } // ISRs with error codes are breaking!
-        //unsafe { amd64::registers::CR0::write(amd64::registers::CR0::read() & !amd64::registers::CR0::PG); }
+        //unsafe { core::arch::asm!("mov [0x100], rax"); }
+        unsafe { core::arch::asm!("int 13"); }
+        //unsafe { segmentation::cs_write(SegSel::new_gdt(amd64::PrivLvl::Ring0, 0)); }
+        //println!("{:?}", amd64::registers::CR0::read());
+        // unsafe { amd64::registers::CR0::write(amd64::registers::CR0::read() &! amd64::registers::CR0::PG); }
     }
 
     // double/triple buffer the framebuffer!
@@ -310,10 +315,12 @@ pub unsafe fn setup_sys_tables(talloc: &crate::memm::talloc::Tallock)
 
     idt.div_by_zero_fault = IntTrapGate::new(div_by_zero_fault as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
     idt.debug = IntTrapGate::new(debug_exception as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
-    idt.break_point_trap = IntTrapGate::new(break_point_trap as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
+    idt.break_point_trap = IntTrapGate::new(naked_breakpoint_trap_wrapper as u64, KRNL_CODE_SEG_SEL, 0, Ssdt::InterruptGate, PrivLvl::Ring0);
     idt.double_fault_abort = IntTrapGate::new(double_fault_abort as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
-    idt.page_fault = IntTrapGate::new(page_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
-    idt.general_protection_fault = IntTrapGate::new(general_protection_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.page_fault = IntTrapGate::new(naked_page_fault_wrapper as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.general_protection_fault = IntTrapGate::new(naked_general_protection_fault_wrapper as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.segment_not_present_fault = IntTrapGate::new(segment_not_present_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
+    idt.alignment_check_fault = IntTrapGate::new(alignment_check_fault as u64,KRNL_CODE_SEG_SEL,0,Ssdt::InterruptGate,PrivLvl::Ring0);
 
     interrupts::lidt(idt.as_ref() as *const _);
 
@@ -331,6 +338,7 @@ extern "x86-interrupt" fn debug_exception(stack_frame: InterruptStackFrame) {
     crate::println!("DEBUG EXCEPTION!\nStack Frame: {:#?}", stack_frame);
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn break_point_trap(stack_frame: InterruptStackFrame) {
     /* let rsp: *const u64;
     unsafe { core::arch::asm!("lea {}, [rsp+0]", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
@@ -353,29 +361,201 @@ extern "C" fn naked_page_fault_wrapper() -> ! {
         ::core::intrinsics::unreachable();
     }
 } */
-/* extern "C" fn naked_page_fault_wrapper() -> ! {
+/* extern "C" fn naked_breakpoint_trap_wrapper() -> ! {
     unsafe {
         core::arch::asm!(
+            "add rsp, 8",
             "mov rdi, rsp",
-            "jmp naked_page_fault",
+            "call naked_breakpoint_trap",
             options(noreturn),
         );
     }
-}
+} */
 #[no_mangle]
-extern "C" fn naked_page_fault(stack_frame: InterruptStackFrame, err_code: u64) -> ! {
+extern "sysv64" fn naked_breakpoint_trap(stack_frame: &InterruptStackFrame) {
+    /* let rsp: *const u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags)); }
+    println!("rsp: {:p}", rsp);
+    /* let rsp = rsp.wrapping_add(rsp as usize % 16);
+    for i in -0x100..0x100 {
+        sys::print!("{:p}:{:x} ", unsafe { rsp.offset(i) }, unsafe { *rsp.offset(i) });
+    } */ */
+
+    crate::println!(
+        "NAKED BREAKPOINT TRAP!\nStack Frame: {:#?}",
+        unsafe { /* &* */stack_frame },
+    );
+    /* amd64::hlt_loop(); */
+}
+/* extern "C" fn naked_page_fault_wrapper() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "add rsp, 8",
+            "pop rsi",
+            "mov rdi, rsp",
+            "call naked_page_fault",
+            options(noreturn),
+        );
+    }
+} */
+#[no_mangle]
+extern "sysv64" fn naked_page_fault(stack_frame: &InterruptStackFrame, err_code: u64) -> ! {
+    let rsp: *const u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags)); }
+    println!("rsp: {:p}", rsp);
+    /* let rsp = rsp.wrapping_add(rsp as usize % 16);
+    for i in -0x100..0x100 {
+        sys::print!("{:p}:{:x} ", unsafe { rsp.offset(i) }, unsafe { *rsp.offset(i) });
+    } */
+
     let cr2 = amd64::registers::cr2_read();
     crate::println!(
         "PAGE FAULT!\nStack Frame: {:#?}\nError code: {:?}\nCR2: {:p}",
-        &stack_frame,
+        stack_frame,
         unsafe { interrupts::PfErrCode::from_bits_unchecked(err_code) },
         cr2
     );
     amd64::hlt_loop();
-} */
+}
+
+/* extern { fn naked_general_protection_fault_wrapper() -> !; }
+core::arch::global_asm!(
+    "naked_general_protection_fault_wrapper:",
+    "and rsp, 0xfffffffffffffff0",
+    "pop rsi",
+    "mov rdi, rsp",
+    "call naked_general_protection_fault"
+); */
+
+/* extern { fn naked_page_fault_wrapper() -> !; }
+core::arch::global_asm!(
+    "naked_page_fault_wrapper:",
+    "and rsp, 0xfffffffffffffff0",
+    "pop rsi",
+    "mov rdi, rsp",
+    "call naked_page_fault"
+); */
+
+/* extern { fn naked_breakpoint_trap_wrapper() -> !; }
+core::arch::global_asm!(
+    "naked_breakpoint_trap_wrapper:",
+    "jmp break_point_trap",
+    "iretq",
+); */
 
 
+extern { fn naked_breakpoint_trap_wrapper(); }
+core::arch::global_asm!("
+naked_breakpoint_trap_wrapper:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov rdi, rsp
+    add rdi, 0x48
+
+    //sub rsp, 8
+
+    call naked_breakpoint_trap
+
+    //add rsp, 8
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    iretq"
+);
+extern { fn naked_page_fault_wrapper() -> !; }
+core::arch::global_asm!("
+naked_page_fault_wrapper:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov rsi, [rsp+0x48]
+    mov rdi, rsp
+    add rdi, 0x50
+
+    sub rsp, 8
+
+    call naked_page_fault
+
+    add rsp, 8
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    add rsp, 8
+
+    iretq"
+);
+extern { fn naked_general_protection_fault_wrapper() -> !; }
+core::arch::global_asm!("
+naked_general_protection_fault_wrapper:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov rsi, [rsp+0x40]
+    mov rdi, rsp
+    add rdi, 0x48
+
+    sub rsp, 8
+
+    call naked_general_protection_fault
+
+    add rsp, 8
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    add rsp, 8
+
+    iretq"
+);
+
+#[no_mangle]
 extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame/* , err_code: u64 */) {
+    /* unsafe { core::arch::asm!("add rsp, 8", options(nomem, preserves_flags)); } */
     /* let rsp: *const u64;
     unsafe { core::arch::asm!("lea {}, [rsp+0]", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
     let slice = core::ptr::slice_from_raw_parts(rsp.wrapping_sub(0x100), 0x200);
@@ -388,36 +568,72 @@ extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame/* , err_co
     println!("rsp {:p}, isf ptr {:p}", rsp, ptr);
     // let ptr = ptr.cast::<u8>().wrapping_sub(128).cast::<InterruptStackFrame>(); */
 
-    let stack_frame_ptr = core::ptr::addr_of!(stack_frame).cast::<u8>().wrapping_add(8).cast::<InterruptStackFrame>();
-    let err_code_ptr = core::ptr::addr_of!(stack_frame).cast::<u64>()/* .wrapping_sub(1) */;
+    let stack_frame = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u8>().wrapping_add(8).cast::<InterruptStackFrame>() };
+    let err_code = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u64>()/* .wrapping_sub(1) */ };
 
     let cr2 = amd64::registers::cr2_read();
     crate::println!(
         "PAGE FAULT!\nStack Frame: {:#?}\nError code: {:?}\nCR2: {:p}",
-        unsafe { *stack_frame_ptr },
-        unsafe { interrupts::PfErrCode::from_bits_unchecked(unsafe { *err_code_ptr }) },
+        &stack_frame,
+        unsafe { interrupts::PfErrCode::from_bits_unchecked(err_code) },
         cr2
     );
 
     amd64::hlt_loop();
 }
 
-extern "x86-interrupt" fn double_fault_abort(stack_frame: InterruptStackFrame, err_code: u64) -> ! {
-    unsafe {
-        let fb = 0xfffffffffc000000 as *mut u8;
-        fb.wrapping_add(512).write_bytes(128, 256);
-    }
+extern "x86-interrupt" fn double_fault_abort(stack_frame: InterruptStackFrame/* , err_code: u64 */) -> ! {
+    let stack_frame = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u8>().wrapping_add(8).cast::<InterruptStackFrame>() };
+    let err_code = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u64>()/* .wrapping_sub(1) */ };
 
     crate::println!("DOUBLE FAULT!\nStack Frame: {:#?}\nError Code: {:#?}", stack_frame, err_code);
 
     amd64::hlt_loop();
 }
 
-extern "x86-interrupt" fn general_protection_fault(stack_frame: InterruptStackFrame, err_code: u64) {
+/* extern "C" fn naked_general_protection_fault_wrapper() -> ! {
+    unsafe {
+        core::arch::asm!(
+            //"add rsp, 8",
+            "pop rsi",
+            "mov rdi, rsp",
+            "call naked_general_protection_fault",
+            options(noreturn),
+        );
+    }
+} */
+#[no_mangle]
+extern "sysv64" fn naked_general_protection_fault(stack_frame: &InterruptStackFrame, err_code: u64) -> ! {
+    crate::println!(
+        "NAKED GENERAL PROTECTION FAULT!\nStack Frame: {:#?}\nError code: {:#x}",
+        stack_frame,
+        err_code
+    );
+    amd64::hlt_loop();
+}
+extern "x86-interrupt" fn general_protection_fault(stack_frame: InterruptStackFrame/* , err_code: u64 */) {
+    let stack_frame = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u8>()/* .wrapping_add(8) */.cast::<InterruptStackFrame>() };
+    let err_code = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u64>().wrapping_sub(1) };
+
     crate::println!("GENERAL PROTECTION FAULT!\nStack Frame: {:#?}", stack_frame);
     if err_code != 0 {
-        crate::println!("Segment Selector: {:#?}", SegSel::from_bits(err_code as u16));
+        crate::println!("Error Code: {:#x}", err_code);
     }
+
+    amd64::hlt_loop();
+}
+
+extern "x86-interrupt" fn segment_not_present_fault(stack_frame: InterruptStackFrame/* , err_code: u64 */) {
+    let stack_frame = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u8>().wrapping_add(8).cast::<InterruptStackFrame>() };
+    let err_code = unsafe { *core::ptr::addr_of!(stack_frame).cast::<u64>()/* .wrapping_sub(1) */ };
+
+    crate::println!("SEGMENT NOT PRESENT FAULT!\nStack Frame: {:#?}\nError Code: {:#x}", stack_frame, err_code);
+
+    amd64::hlt_loop();
+}
+
+extern "x86-interrupt" fn alignment_check_fault(stack_frame: InterruptStackFrame, err_code: u64) {
+    crate::println!("ALIGNMENT CHECK FAULT!\nStack Frame: {:#?}\nError Code: {:#x}", stack_frame, err_code);
 
     amd64::hlt_loop();
 }

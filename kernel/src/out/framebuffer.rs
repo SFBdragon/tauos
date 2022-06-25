@@ -45,7 +45,7 @@ pub struct FrameBuffer {
     pub width: usize,
     /// Vertical resolution in pixels.
     pub height: usize,
-    /// Scanline width in bytes.
+    /// Pitch in bytes.
     pub stride: usize,
     /// Internal pixel format.
     pub format: PixelFormat,
@@ -94,10 +94,8 @@ impl FrameBuffer {
         let one_pixel = color_to_pixel(dst_one_color, self.format);
 
         for row in 0..height {
-            //let mut byte = *src.get_unchecked(offset / 8 + row * stride);
             for col in 0..width {
                 let bit_offset = col + offset;
-                //if bit_offset % 8 == 0 { byte = *src.get_unchecked(bit_offset / 8 + row * stride); }
                 let pixel_ptr = self.buffer.get_unchecked_mut((dst_x + col) * 4 + (dst_y + row) * self.stride);
                 if *src.get_unchecked((bit_offset + row * stride) / 8) & 1 << (7 - bit_offset % 8) != 0 {
                     pixel_ptr.cast::<[u8; 4]>().write(one_pixel);
