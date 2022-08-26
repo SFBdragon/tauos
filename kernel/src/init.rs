@@ -24,7 +24,7 @@ use core::{panic::PanicInfo, sync::atomic::{AtomicUsize, Ordering}, alloc::{Layo
  
 use alloc::boxed::Box;
 use amd64::{self, paging, registers::CR3};
-use sys::{println, memm::{self, talloc::{Tallock, Talloc}}, from_phys_addr, cfg};
+use sys::{println, memm::{self, talloc::{Tallock, Talloc}}, from_phys_addr, cfg, out::framebuffer};
 
 
 // NO GLOBAL ALLOCATOR
@@ -61,10 +61,10 @@ pub extern "C" fn _start() -> ! {
                 (*bootboot::BOOTBOOT).fb_height as usize,
                 (*bootboot::BOOTBOOT).fb_scanline as usize,
                 match (*bootboot::BOOTBOOT).fb_type {
-                    bootboot::FB_ABGR => sys::out::framebuffer::PixelFormat::ABGR,
-                    bootboot::FB_ARGB => sys::out::framebuffer::PixelFormat::ARGB,
-                    bootboot::FB_BGRA => sys::out::framebuffer::PixelFormat::BGRA,
-                    bootboot::FB_RGBA => sys::out::framebuffer::PixelFormat::RGBA,
+                    bootboot::FB_ABGR => framebuffer::PixelFormat::ABGR,
+                    bootboot::FB_ARGB => framebuffer::PixelFormat::ARGB,
+                    bootboot::FB_BGRA => framebuffer::PixelFormat::BGRA,
+                    bootboot::FB_RGBA => framebuffer::PixelFormat::RGBA,
                     _ => panic!()
                 }
             );
